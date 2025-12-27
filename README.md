@@ -1,5 +1,7 @@
 # Mystic Update
 
+![Mystic Update Logo](https://raw.githubusercontent.com/fuyo2/mystic-update/aee9368beed5c6955e85e43e77c8a4c8ce015a7a/resources/icons/hicolor/scalable/apps/mystic-update.svg)
+
 Mystical Software Updater for Linux Distributions.
 
 ## Installation
