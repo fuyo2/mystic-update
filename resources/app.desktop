@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Mystic Update
+Comment=Simple Updater for the COSMIC desktop
+Type=Application
+Icon=mystic-update
+Exec=mystic-update
+Terminal=false
+StartupNotify=true
+Categories=System;Utility;COSMIC;
+Keywords=COSMIC;
+X-Cosmic-AppId=dev.jcole.MysticUpdate
