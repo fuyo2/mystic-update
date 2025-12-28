@@ -1,12 +1,13 @@
 # Mystic Update
 
-![Mystic Update Logo](https://raw.githubusercontent.com/fuyo2/mystic-update/aee9368beed5c6955e85e43e77c8a4c8ce015a7a/resources/icons/hicolor/scalable/apps/mystic-update.svg)
+![Mystic Update Logo](https://raw.githubusercontent.com/fuyo2/mystic-update/aee9368beed5c6955e85e43e77c8a4c8ce015a7a/resources/icons/hicolor/scalable/apps/mystic-update.svg =128x128)
+![Mystic Update Application](https://raw.githubusercontent.com/fuyo2/mystic-update/aee9368beed5c6955e85e43e77c8a4c8ce015a7a/resources/icons/hicolor/scalable/apps/mystic-update.svg)
 
 Mystical Software Updater for Linux Distributions.
 
 ## Installation
 
-This application is programed in [rust](https://github.com/rust-lang/rust) using the [libcosmic](https://github.com/pop-os/libcosmic) toolkit:
+This application is programmed in [rust](https://github.com/rust-lang/rust) using the [libcosmic](https://github.com/pop-os/libcosmic) toolkit:
 
 A [justfile](./justfile) is included by default for the [just](https://github.com/casey/just) command runner.
 
