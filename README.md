@@ -17,3 +17,20 @@ A [justfile](./justfile) is included by default for the [just](https://github.co
 - `just build-vendored` compiles with vendored dependencies from that tarball
 - `just check` runs clippy on the project to check for linter warnings
 - `just check-json` can be used by IDEs that support LSP
+
+## Features
+
+Includes the following features:
+- Easy updates to your Linux system using the following package managers:
+    - Apt
+    - Brew
+    - Dnf
+    - Emerge
+    - Flatpak
+    - Nix-env
+    - Pacman
+    - Snap
+    - Yum
+    - Zypper
+- Asks if you want to reboot after updates
+- View update logs from within Mystic Update application
