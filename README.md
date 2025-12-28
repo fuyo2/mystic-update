@@ -20,7 +20,6 @@ A [justfile](./justfile) is included by default for the [just](https://github.co
 
 ## Features
 
-- Alpha version of the program submitted. Includes the following features:
 Easy updates to your Linux system using the following package managers:
     - Apt
     - Brew
