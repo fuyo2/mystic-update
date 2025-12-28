@@ -2,14 +2,14 @@
 
 use crate::config::Config;
 use crate::fl;
-use crate::update::{self, ManagerId, TaskStatus, UpdateOutcome};
+use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome};
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::Horizontal;
-use cosmic::iced::{Alignment, Length, Subscription};
+use cosmic::iced::{Alignment, Background, Color, Length, Subscription};
 use cosmic::widget::{self, about::About, menu};
 use cosmic::{prelude::*, Task};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] =
@@ -24,6 +24,25 @@ struct ManagerState {
     check_output: String,
     checking: bool,
     update_available: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct UpdateKey {
+    manager: ManagerId,
+    id: String,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateItem {
+    entry: UpdateEntry,
+    checked: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DetailsTab {
+    Information,
+    Packages,
+    Changelog,
 }
 
 /// The application model stores app-specific state used to describe its interface and
@@ -55,10 +74,16 @@ pub struct AppModel {
     reboot_prompt: bool,
     /// Track an in-progress reboot request.
     reboot_in_progress: bool,
-    /// Show the updates prompt after checks complete.
-    updates_prompt: bool,
-    /// Allow dismissing the updates prompt for this session.
-    updates_prompt_dismissed: bool,
+    /// Parsed update items for supported managers.
+    update_items: Vec<UpdateItem>,
+    /// Selected update for the details panel.
+    selected_update: Option<UpdateKey>,
+    /// Selected tab for update details.
+    details_tab: DetailsTab,
+    /// True when showing the update details view.
+    show_update_details: bool,
+    /// Track update selections at the start of a manager run.
+    manager_run_selection: HashMap<ManagerId, Option<Vec<UpdateKey>>>,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -72,10 +97,14 @@ pub enum Message {
     CheckUpdates,
     RunManager(ManagerId),
     RunAll,
-    InstallUpdates,
     UpdateComplete(ManagerId, UpdateOutcome),
     SelectManager(ManagerId),
-    UpdatesDismiss,
+    ToggleUpdate(UpdateKey, bool),
+    SelectUpdate(UpdateKey),
+    SelectDetailsTab(DetailsTab),
+    ShowUpdatesList,
+    SelectAllUpdates,
+    SelectNoUpdates,
     RebootNow,
     RebootDismiss,
     RebootFinished(Result<(), String>),
@@ -155,8 +184,11 @@ impl cosmic::Application for AppModel {
             run_all_output: String::new(),
             reboot_prompt: false,
             reboot_in_progress: false,
-            updates_prompt: false,
-            updates_prompt_dismissed: false,
+            update_items: Vec::new(),
+            selected_update: None,
+            details_tab: DetailsTab::Information,
+            show_update_details: false,
+            manager_run_selection: HashMap::new(),
         };
 
         let set_title = app.update_title();
@@ -174,6 +206,7 @@ impl cosmic::Application for AppModel {
                 &self.key_binds,
                 vec![
                     menu::Item::Button(fl!("about"), None, MenuAction::About),
+                    menu::Item::Button(fl!("summoners"), None, MenuAction::Summoners),
                     menu::Item::Button(fl!("logs"), None, MenuAction::Logs),
                 ],
             ),
@@ -194,6 +227,18 @@ impl cosmic::Application for AppModel {
                 |url| Message::LaunchUrl(url.to_string()),
                 Message::ToggleContextPage(ContextPage::About),
             ),
+            ContextPage::Summoners => {
+                let space_s = cosmic::theme::spacing().space_s;
+                let content = widget::container(self.summoners_drawer_content())
+                    .width(Length::Fill)
+                    .padding(space_s);
+
+                context_drawer::context_drawer(
+                    content,
+                    Message::ToggleContextPage(ContextPage::Summoners),
+                )
+                .title(fl!("summoners-title"))
+            }
             ContextPage::Logs => {
                 let content = widget::scrollable(
                     widget::container(widget::text::body(self.log_text.clone()))
@@ -235,141 +280,173 @@ impl cosmic::Application for AppModel {
             run_all_button
         };
 
-        let header = widget::container(widget::text::title1(fl!("app-title")))
-            .width(Length::Fill)
-            .align_x(Horizontal::Left);
-
-        let summary = widget::container(widget::text::body(fl!("detected-summary", available = available_count)))
-            .width(Length::Fill)
-            .align_x(Horizontal::Center);
-
-        let mut manager_list = widget::column::with_capacity(self.managers.len())
-            .spacing(space_s)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center);
-
-        for id in ManagerId::all() {
-            let spec = id.spec();
-            let state = self.managers.get(id).expect("manager state missing");
-
-            if !state.available {
-                continue;
-            }
-
-            let mut status_label = if state.checking {
-                fl!("status-checking")
-            } else if state.update_available {
-                fl!("status-updates-available")
-            } else {
-                match &state.status {
-                    TaskStatus::Idle => fl!("status-up-to-date"),
-                    TaskStatus::Running => fl!("status-running"),
-                    TaskStatus::Success => fl!("status-success"),
-                    TaskStatus::Failed(reason) => {
-                        if reason.is_empty() {
-                            fl!("status-failed")
-                        } else {
-                            format!("{}: {}", fl!("status-failed"), reason)
-                        }
-                    }
-                }
-            };
-            if state.requires_privilege {
-                status_label.push_str(" · ");
-                status_label.push_str(&fl!("requires-auth"));
-            }
-
-            let status_widget: Element<_> = if state.checking {
-                widget::row::with_capacity(2)
-                    .push(widget::icon::from_name("process-working-symbolic"))
-                    .push(widget::text::caption(status_label))
-                    .align_y(Alignment::Center)
-                    .spacing(space_s)
-                    .into()
-            } else {
-                widget::text::caption(status_label).into()
-            };
-
-            let update_button = widget::button::standard(fl!("update"));
-            let update_button = if !matches!(state.status, TaskStatus::Running) {
-                update_button.on_press(Message::RunManager(*id))
-            } else {
-                update_button
-            };
-
-            let view_button = widget::button::standard(fl!("view-log"))
-                .on_press(Message::SelectManager(*id));
-
-            let row = widget::row::with_capacity(4)
-                .push(widget::text::body(spec.label))
-                .push(status_widget)
-                .push(update_button)
-                .push(view_button)
-                .align_y(Alignment::Center)
-                .spacing(space_s);
-
-            manager_list = manager_list.push(row);
-        }
-
-        let updates_title = widget::text::title4(fl!("updates-title"));
-        let updates_content: Element<_> = if self.any_checking() {
-            widget::row::with_capacity(2)
-                .push(widget::icon::from_name("process-working-symbolic"))
-                .push(widget::text::body(fl!("updates-checking")))
+        let header_row: Element<_> = if self.show_update_details {
+            widget::row::with_capacity(4)
+                .push(self.back_button())
+                .push(widget::horizontal_space())
+                .push(check_updates_button)
+                .push(run_all_button)
                 .align_y(Alignment::Center)
                 .spacing(space_s)
                 .into()
         } else {
-            widget::text::body(self.updates_output()).into()
+            widget::row::with_capacity(4)
+                .push(widget::text::title1(fl!("app-title")))
+                .push(widget::horizontal_space())
+                .push(check_updates_button)
+                .push(run_all_button)
+                .align_y(Alignment::Center)
+                .spacing(space_s)
+                .into()
+        };
+        let header = widget::container(header_row)
+            .width(Length::Fill)
+            .padding([0, space_s]);
+
+        let updates_section: Element<_> = if self.update_items.is_empty() {
+            let updates_content: Element<_> = if self.any_checking() {
+                widget::row::with_capacity(2)
+                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(widget::text::body(fl!("updates-checking")))
+                    .align_y(Alignment::Center)
+                    .spacing(space_s)
+                    .into()
+            } else {
+                widget::text::body(self.updates_output()).into()
+            };
+
+            let updates_body = widget::scrollable(
+                widget::container(updates_content)
+                    .width(Length::Fill)
+                    .align_x(Horizontal::Center)
+                    .padding(space_s),
+            )
+            .height(Length::Fill);
+
+            widget::column::with_capacity(1)
+                .push(widget::container(updates_body).width(Length::Fill).align_x(Horizontal::Center))
+                .spacing(space_s)
+                .width(Length::Fill)
+                .into()
+        } else {
+            let selected_count = self
+                .update_items
+                .iter()
+                .filter(|item| item.checked)
+                .count();
+            let total_updates = self.update_items.len();
+
+            if self.show_update_details {
+                widget::container(self.update_details_view())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            } else {
+                let updates_header = widget::column::with_capacity(2)
+                    .push(
+                        widget::row::with_capacity(4)
+                            .push(widget::horizontal_space())
+                            .push(
+                                widget::button::standard(fl!("updates-check-all"))
+                                    .on_press(Message::SelectAllUpdates),
+                            )
+                            .push(
+                                widget::button::standard(fl!("updates-uncheck-all"))
+                                    .on_press(Message::SelectNoUpdates),
+                            )
+                            .align_y(Alignment::Center)
+                            .spacing(space_s),
+                    )
+                    .push(
+                        widget::row::with_capacity(2)
+                            .push(widget::horizontal_space())
+                            .push(widget::text::caption(fl!(
+                                "updates-selected",
+                                selected = selected_count,
+                                total = total_updates
+                            )))
+                            .align_y(Alignment::Center),
+                    )
+                    .spacing(space_s / 2);
+
+                let mut cards = widget::column::with_capacity(self.update_items.len())
+                    .width(Length::Fill)
+                    .spacing(space_s);
+
+                for item in &self.update_items {
+                    let key = item.key();
+                    let title = widget::text::body(Self::update_display_name(&item.entry));
+                    let subtitle = widget::text::caption(Self::update_subtitle(&item.entry));
+                    let text_block = widget::column::with_capacity(2)
+                        .push(title)
+                        .push(subtitle)
+                        .spacing(space_s / 2);
+
+                    let icon = widget::icon::from_name("package-x-generic-symbolic");
+                    let info_row = widget::row::with_capacity(2)
+                        .push(icon)
+                        .push(text_block)
+                        .align_y(Alignment::Center)
+                        .spacing(space_s);
+
+                    let info_area = widget::mouse_area(info_row)
+                        .on_press(Message::SelectUpdate(key.clone()));
+
+                    let checkbox = widget::checkbox("", item.checked)
+                        .on_toggle(move |checked| Message::ToggleUpdate(key.clone(), checked));
+
+                    let card_row = widget::row::with_capacity(2)
+                        .push(widget::container(info_area).width(Length::Fill))
+                        .push(widget::container(checkbox))
+                        .align_y(Alignment::Center)
+                        .spacing(space_s);
+
+                    let content = widget::container(card_row)
+                        .width(Length::Fill)
+                        .padding(space_s);
+
+                    let mut card_body = widget::column::with_capacity(2)
+                        .push(content)
+                        .spacing(0);
+
+                    if let Some(progress_value) = self.update_progress_value(item) {
+                        let progress_bar = widget::progress_bar(0.0..=100.0, progress_value)
+                            .height(Length::Fixed(4.0));
+                        card_body = card_body.push(progress_bar);
+                    }
+
+                    let card = widget::container(card_body)
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Container::ContextDrawer);
+                    cards = cards.push(card);
+                }
+
+                let updates_body = widget::scrollable(
+                    widget::container(cards)
+                        .width(Length::Fill)
+                        .padding(space_s),
+                )
+                .height(Length::Fill);
+
+                widget::column::with_capacity(2)
+                    .push(widget::container(updates_header).width(Length::Fill))
+                    .push(widget::container(updates_body).width(Length::Fill))
+                    .spacing(space_s)
+                    .width(Length::Fill)
+                    .into()
+            }
         };
 
-        let updates_body = widget::scrollable(
-            widget::container(updates_content)
-                .width(Length::Fill)
-                .align_x(Horizontal::Center)
-                .padding(space_s),
-        )
-        .height(Length::Fill);
-
-        let footer = widget::row::with_capacity(4)
-            .push(widget::horizontal_space())
-            .push(check_updates_button)
-            .push(run_all_button)
-            .align_y(Alignment::Center)
-            .spacing(space_s);
-
         let body = widget::column::with_capacity(4)
-            .push(summary)
-            .push(widget::container(manager_list).padding(space_s))
-            .push(widget::container(updates_title).width(Length::Fill).align_x(Horizontal::Left))
-            .push(widget::container(updates_body).width(Length::Fill).align_x(Horizontal::Center))
+            .push(widget::container(updates_section).width(Length::Fill))
             .spacing(space_s)
             .width(Length::Fill);
 
-        let mut content = widget::column::with_capacity(7)
+        let mut content = widget::column::with_capacity(6)
             .push(header)
             .push(body)
-            .push(widget::container(footer).padding(space_s))
             .spacing(space_s)
             .height(Length::Fill);
-
-        if self.updates_prompt && !self.updates_prompt_dismissed {
-            let install_button = widget::button::suggested(fl!("install-updates"));
-            let install_button = if any_running {
-                install_button
-            } else {
-                install_button.on_press(Message::InstallUpdates)
-            };
-
-            let updates_bar = widget::row::with_capacity(3)
-                .push(widget::text::body(fl!("updates-prompt")))
-                .push(install_button)
-                .push(widget::button::standard(fl!("updates-later")).on_press(Message::UpdatesDismiss))
-                .align_y(Alignment::Center)
-                .spacing(space_s);
-
-            content = content.push(widget::container(updates_bar).padding(space_s));
-        }
 
         if self.reboot_prompt {
             let reboot_button = widget::button::suggested(fl!("reboot-now"));
@@ -423,17 +500,16 @@ impl cosmic::Application for AppModel {
                 if let Some(state) = self.managers.get_mut(&id) {
                     state.checking = false;
                     state.check_output = outcome.output.clone();
-                    state.update_available = outcome.has_updates;
-                    if let Some(err) = outcome.error {
-                        state.status = TaskStatus::Failed(err);
+                    if let Some(err) = outcome.error.as_ref() {
+                        state.status = TaskStatus::Failed(err.clone());
+                    } else {
+                        state.update_available = outcome.has_updates;
                     }
                 }
 
-                if !self.updates_prompt_dismissed {
-                    self.updates_prompt = self
-                        .managers
-                        .values()
-                        .any(|state| state.update_available);
+                if outcome.error.is_none() {
+                    let entries = update::parse_updates(id, &outcome.output);
+                    self.set_update_entries(id, entries);
                 }
 
                 if self.selected_manager == Some(id) {
@@ -451,7 +527,6 @@ impl cosmic::Application for AppModel {
                 self.run_all_queue.clear();
                 self.run_all_active = false;
                 self.run_all_output.clear();
-                self.updates_prompt = false;
                 return self.start_manager_update(id);
             }
             Message::RunAll => {
@@ -460,22 +535,7 @@ impl cosmic::Application for AppModel {
                 self.run_all_output.clear();
                 self.selected_manager = None;
                 self.log_text = fl!("status-running");
-                self.updates_prompt = false;
-                self.updates_prompt_dismissed = true;
                 self.enqueue_updates(true);
-                if let Some(next_id) = self.run_all_queue.pop_front() {
-                    return self.start_manager_update(next_id);
-                }
-            }
-            Message::InstallUpdates => {
-                self.run_all_queue.clear();
-                self.run_all_active = true;
-                self.run_all_output.clear();
-                self.selected_manager = None;
-                self.log_text = fl!("status-running");
-                self.updates_prompt = false;
-                self.updates_prompt_dismissed = true;
-                self.enqueue_updates(false);
                 if let Some(next_id) = self.run_all_queue.pop_front() {
                     return self.start_manager_update(next_id);
                 }
@@ -491,6 +551,10 @@ impl cosmic::Application for AppModel {
 
                 if id == ManagerId::Apt && matches!(outcome.status, TaskStatus::Success) {
                     self.reboot_prompt = update::apt_has_updates(&outcome.output);
+                }
+
+                if matches!(outcome.status, TaskStatus::Success) && !self.run_all_active {
+                    self.remove_completed_updates(id);
                 }
 
                 if self.run_all_active {
@@ -509,6 +573,8 @@ impl cosmic::Application for AppModel {
 
                 if self.run_all_active {
                     self.run_all_active = false;
+                    self.manager_run_selection.clear();
+                    return self.start_checks(true);
                 }
             }
             Message::SelectManager(id) => {
@@ -523,6 +589,35 @@ impl cosmic::Application for AppModel {
                 self.context_page = ContextPage::Logs;
                 self.core.window.show_context = true;
             }
+            Message::ToggleUpdate(key, checked) => {
+                if let Some(item) = self
+                    .update_items
+                    .iter_mut()
+                    .find(|item| item.key() == key)
+                {
+                    item.checked = checked;
+                }
+            }
+            Message::SelectUpdate(key) => {
+                self.selected_update = Some(key);
+                self.show_update_details = true;
+            }
+            Message::SelectDetailsTab(tab) => {
+                self.details_tab = tab;
+            }
+            Message::ShowUpdatesList => {
+                self.show_update_details = false;
+            }
+            Message::SelectAllUpdates => {
+                for item in &mut self.update_items {
+                    item.checked = true;
+                }
+            }
+            Message::SelectNoUpdates => {
+                for item in &mut self.update_items {
+                    item.checked = false;
+                }
+            }
             Message::RebootNow => {
                 self.reboot_in_progress = true;
                 return Task::perform(update::reboot_system(), Message::RebootFinished)
@@ -530,10 +625,6 @@ impl cosmic::Application for AppModel {
             }
             Message::RebootDismiss => {
                 self.reboot_prompt = false;
-            }
-            Message::UpdatesDismiss => {
-                self.updates_prompt = false;
-                self.updates_prompt_dismissed = true;
             }
             Message::RebootFinished(result) => {
                 self.reboot_in_progress = false;
@@ -586,15 +677,34 @@ impl AppModel {
         id: ManagerId,
     ) -> Task<cosmic::Action<Message>> {
         self.set_running(id);
-        Task::perform(update::run_manager(id), move |outcome| {
-            Message::UpdateComplete(id, outcome)
-        })
-        .map(cosmic::Action::App)
+        let selected = self.selected_updates_for_manager(id);
+        if self.supports_update_selection(id) && !selected.is_empty() {
+            let selection = selected
+                .iter()
+                .map(|entry| UpdateKey {
+                    manager: id,
+                    id: entry.id.clone(),
+                })
+                .collect();
+            self.manager_run_selection.insert(id, Some(selection));
+            Task::perform(update::run_manager_selected(id, selected), move |outcome| {
+                Message::UpdateComplete(id, outcome)
+            })
+            .map(cosmic::Action::App)
+        } else {
+            if self.supports_update_selection(id) {
+                self.manager_run_selection.insert(id, None);
+            } else {
+                self.manager_run_selection.remove(&id);
+            }
+            Task::perform(update::run_manager(id), move |outcome| {
+                Message::UpdateComplete(id, outcome)
+            })
+            .map(cosmic::Action::App)
+        }
     }
 
     fn start_checks(&mut self, force_privileged: bool) -> Task<cosmic::Action<Message>> {
-        self.updates_prompt = false;
-        self.updates_prompt_dismissed = false;
         let mut tasks = Vec::new();
 
         for id in ManagerId::all() {
@@ -623,6 +733,13 @@ impl AppModel {
         for id in ManagerId::all() {
             if let Some(state) = self.managers.get(id) {
                 if !state.available || matches!(state.status, TaskStatus::Running) {
+                    continue;
+                }
+
+                if self.supports_update_selection(*id) {
+                    if self.has_selected_updates(*id) {
+                        self.run_all_queue.push_back(*id);
+                    }
                     continue;
                 }
 
@@ -685,20 +802,416 @@ impl AppModel {
             output
         }
     }
+
+    fn supports_update_selection(&self, id: ManagerId) -> bool {
+        matches!(id, ManagerId::Apt | ManagerId::Flatpak)
+    }
+
+    fn has_selected_updates(&self, id: ManagerId) -> bool {
+        self.update_items.iter().any(|item| {
+            item.entry.manager == id && item.checked
+        })
+    }
+
+    fn selected_updates_for_manager(&self, id: ManagerId) -> Vec<UpdateEntry> {
+        self.update_items
+            .iter()
+            .filter(|item| item.entry.manager == id && item.checked)
+            .map(|item| item.entry.clone())
+            .collect()
+    }
+
+    fn set_update_entries(&mut self, id: ManagerId, entries: Vec<UpdateEntry>) {
+        self.update_items
+            .retain(|item| item.entry.manager != id);
+
+        for entry in entries {
+            self.update_items.push(UpdateItem {
+                entry,
+                checked: true,
+            });
+        }
+
+        self.prune_selected_update();
+    }
+
+    fn remove_completed_updates(&mut self, id: ManagerId) {
+        let selection = if self.supports_update_selection(id) {
+            self.manager_run_selection.remove(&id).unwrap_or(None)
+        } else {
+            None
+        };
+
+        match selection {
+            Some(keys) => {
+                let key_set: HashSet<UpdateKey> = keys.into_iter().collect();
+                self.update_items.retain(|item| {
+                    item.entry.manager != id || !key_set.contains(&item.key())
+                });
+            }
+            None => {
+                self.update_items
+                    .retain(|item| item.entry.manager != id);
+            }
+        }
+
+        self.prune_selected_update();
+
+        if let Some(state) = self.managers.get_mut(&id) {
+            state.update_available = self
+                .update_items
+                .iter()
+                .any(|item| item.entry.manager == id);
+        }
+    }
+
+    fn prune_selected_update(&mut self) {
+        if let Some(selected) = &self.selected_update {
+            let still_exists = self.update_items.iter().any(|item| item.key() == *selected);
+            if !still_exists {
+                self.selected_update = None;
+                self.show_update_details = false;
+            }
+        }
+    }
+
+    fn details_text(&self) -> String {
+        let Some(selected) = &self.selected_update else {
+            return fl!("details-none");
+        };
+
+        let Some(item) = self
+            .update_items
+            .iter()
+            .find(|item| item.key() == *selected)
+        else {
+            return fl!("details-none");
+        };
+
+        match self.details_tab {
+            DetailsTab::Information => {
+                let mut info = Vec::new();
+                info.push(format!(
+                    "{}: {}",
+                    fl!("details-manager"),
+                    item.entry.manager.spec().label
+                ));
+                info.push(format!(
+                    "{}: {}",
+                    fl!("details-name"),
+                    Self::update_display_name(&item.entry)
+                ));
+                if let Some(current) = &item.entry.current_version {
+                    info.push(format!("{}: {}", fl!("details-current"), current));
+                }
+                if let Some(new) = &item.entry.new_version {
+                    info.push(format!("{}: {}", fl!("details-new"), new));
+                }
+                if let Some(scope) = item.entry.scope {
+                    let scope_label = match scope {
+                        update::InstallScope::User => fl!("details-scope-user"),
+                        update::InstallScope::System => fl!("details-scope-system"),
+                    };
+                    info.push(format!("{}: {}", fl!("details-scope"), scope_label));
+                }
+                info.join("\n")
+            }
+            DetailsTab::Packages => {
+                if item.entry.manager == ManagerId::Flatpak {
+                    format!("{}: {}", fl!("details-ref"), item.entry.id.as_str())
+                } else {
+                    format!("{}: {}", fl!("details-package"), item.entry.id.as_str())
+                }
+            }
+            DetailsTab::Changelog => fl!("details-changelog-unavailable"),
+        }
+    }
+
+    fn update_display_name(entry: &UpdateEntry) -> &str {
+        let name = entry.name.trim();
+        if name.is_empty() {
+            entry.id.as_str()
+        } else {
+            name
+        }
+    }
+
+    fn update_subtitle(entry: &UpdateEntry) -> String {
+        let manager = entry.manager.spec().label;
+        let current = entry
+            .current_version
+            .clone()
+            .unwrap_or_else(|| fl!("version-unknown"));
+        let new = entry
+            .new_version
+            .clone()
+            .unwrap_or_else(|| fl!("version-unknown"));
+
+        format!(
+            "{} · {} {} -> {} {}",
+            manager,
+            fl!("details-current"),
+            current,
+            fl!("details-new"),
+            new
+        )
+    }
+
+    fn update_progress_value(&self, item: &UpdateItem) -> Option<f32> {
+        if !item.checked {
+            return None;
+        }
+
+        let Some(state) = self.managers.get(&item.entry.manager) else {
+            return None;
+        };
+
+        match &state.status {
+            TaskStatus::Running => Some(50.0),
+            _ => None,
+        }
+    }
+
+    fn details_tabs(&self) -> Element<'_, Message> {
+        let info_button = if self.details_tab == DetailsTab::Information {
+            widget::button::suggested(fl!("details-information"))
+        } else {
+            widget::button::standard(fl!("details-information"))
+                .on_press(Message::SelectDetailsTab(DetailsTab::Information))
+        };
+        let packages_button = if self.details_tab == DetailsTab::Packages {
+            widget::button::suggested(fl!("details-packages"))
+        } else {
+            widget::button::standard(fl!("details-packages"))
+                .on_press(Message::SelectDetailsTab(DetailsTab::Packages))
+        };
+        let changelog_button = if self.details_tab == DetailsTab::Changelog {
+            widget::button::suggested(fl!("details-changelog"))
+        } else {
+            widget::button::standard(fl!("details-changelog"))
+                .on_press(Message::SelectDetailsTab(DetailsTab::Changelog))
+        };
+
+        widget::row::with_capacity(3)
+            .push(info_button)
+            .push(packages_button)
+            .push(changelog_button)
+            .spacing(cosmic::theme::spacing().space_s)
+            .into()
+    }
+
+    fn update_details_view(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let (title, subtitle) = self
+            .selected_update
+            .as_ref()
+            .and_then(|selected| {
+                self.update_items
+                    .iter()
+                    .find(|item| item.key() == *selected)
+            })
+            .map(|item| {
+                (
+                    Self::update_display_name(&item.entry).to_string(),
+                    Self::update_subtitle(&item.entry),
+                )
+            })
+            .unwrap_or_else(|| (fl!("details-title"), String::new()));
+
+        let details_body = widget::scrollable(
+            widget::container(widget::text::body(self.details_text()))
+                .width(Length::Fill)
+                .padding(space_s),
+        )
+        .height(Length::Fill);
+
+        let header = widget::column::with_capacity(2)
+            .push(widget::text::title3(title))
+            .push(widget::text::caption(subtitle))
+            .spacing(space_s / 2);
+
+        widget::column::with_capacity(4)
+            .push(header)
+            .push(self.details_tabs())
+            .push(details_body)
+            .spacing(space_s)
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn back_button(&self) -> Element<'_, Message> {
+        let style = cosmic::theme::Button::Custom {
+            active: Box::new(|_focused, theme| {
+                let cosmic = theme.cosmic();
+                let mut style = widget::button::Style::new();
+                style.text_color = Some(Color::from(cosmic.accent_text_color()));
+                style.icon_color = Some(Color::from(cosmic.accent_text_color()));
+                style.border_radius = cosmic.corner_radii.radius_xl.into();
+                style
+            }),
+            disabled: Box::new(|theme| {
+                let cosmic = theme.cosmic();
+                let mut style = widget::button::Style::new();
+                style.text_color = Some(Color::from(cosmic.accent_text_color()));
+                style.icon_color = Some(Color::from(cosmic.accent_text_color()));
+                style.border_radius = cosmic.corner_radii.radius_xl.into();
+                style
+            }),
+            hovered: Box::new(|_focused, theme| {
+                let cosmic = theme.cosmic();
+                let mut style = widget::button::Style::new();
+                style.background = Some(Background::Color(cosmic.accent_button.hover.into()));
+                style.text_color = Some(Color::from(cosmic.accent_button.on));
+                style.icon_color = Some(Color::from(cosmic.accent_button.on));
+                style.border_radius = cosmic.corner_radii.radius_xl.into();
+                style
+            }),
+            pressed: Box::new(|_focused, theme| {
+                let cosmic = theme.cosmic();
+                let mut style = widget::button::Style::new();
+                style.text_color = Some(Color::from(cosmic.accent_text_color()));
+                style.icon_color = Some(Color::from(cosmic.accent_text_color()));
+                style.border_radius = cosmic.corner_radii.radius_xl.into();
+                style
+            }),
+        };
+
+        let label = widget::row::with_capacity(2)
+            .push(widget::icon::from_name("go-previous-symbolic"))
+            .push(widget::text::body(fl!("back")))
+            .align_y(Alignment::Center)
+            .spacing(cosmic::theme::spacing().space_s);
+
+        widget::button::custom(label)
+            .class(style)
+            .on_press(Message::ShowUpdatesList)
+            .into()
+    }
+
+    fn summoners_drawer_content(&self) -> Element<'_, Message> {
+        let space_s = cosmic::theme::spacing().space_s;
+        let (available_count, _total_count) = self.manager_counts();
+
+        let summary = widget::container(widget::text::body(fl!(
+            "detected-summary",
+            available = available_count
+        )))
+        .width(Length::Fill)
+        .align_x(Horizontal::Center);
+
+        let mut manager_list = widget::column::with_capacity(self.managers.len())
+            .spacing(space_s)
+            .width(Length::Fill)
+            .align_x(Horizontal::Center);
+
+        for id in ManagerId::all() {
+            let spec = id.spec();
+            let state = self.managers.get(id).expect("manager state missing");
+
+            if !state.available {
+                continue;
+            }
+
+            let mut status_label = if state.checking {
+                fl!("status-checking")
+            } else if state.update_available {
+                fl!("status-updates-available")
+            } else {
+                match &state.status {
+                    TaskStatus::Idle => fl!("status-up-to-date"),
+                    TaskStatus::Running => fl!("status-running"),
+                    TaskStatus::Success => fl!("status-success"),
+                    TaskStatus::Failed(reason) => {
+                        if reason.is_empty() {
+                            fl!("status-failed")
+                        } else {
+                            format!("{}: {}", fl!("status-failed"), reason)
+                        }
+                    }
+                }
+            };
+            if state.requires_privilege {
+                status_label.push_str(" · ");
+                status_label.push_str(&fl!("requires-auth"));
+            }
+
+            let status_widget: Element<_> = if state.checking {
+                widget::row::with_capacity(2)
+                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(widget::text::caption(status_label))
+                    .align_y(Alignment::Center)
+                    .spacing(space_s)
+                    .into()
+            } else {
+                widget::text::caption(status_label).into()
+            };
+
+            let update_button = widget::button::standard(fl!("update"));
+            let update_button = if !matches!(state.status, TaskStatus::Running) {
+                update_button.on_press(Message::RunManager(*id))
+            } else {
+                update_button
+            };
+
+            let view_button = widget::button::standard(fl!("view-log"))
+                .on_press(Message::SelectManager(*id));
+
+            let info_row = widget::row::with_capacity(2)
+                .push(
+                    widget::container(widget::text::body(spec.label))
+                        .width(Length::FillPortion(1)),
+                )
+                .push(widget::container(status_widget).width(Length::FillPortion(4)))
+                .align_y(Alignment::Center)
+                .spacing(space_s);
+
+            let actions_row = widget::row::with_capacity(3)
+                .push(widget::horizontal_space())
+                .push(update_button)
+                .push(view_button)
+                .align_y(Alignment::Center)
+                .spacing(space_s);
+
+            let row = widget::column::with_capacity(2)
+                .push(info_row)
+                .push(actions_row)
+                .spacing(space_s / 2)
+                .width(Length::Fill);
+
+            manager_list = manager_list.push(row);
+        }
+
+        widget::column::with_capacity(2)
+            .push(summary)
+            .push(widget::container(manager_list))
+            .spacing(space_s)
+            .width(Length::Fill)
+            .into()
+    }
 }
 
+impl UpdateItem {
+    fn key(&self) -> UpdateKey {
+        UpdateKey {
+            manager: self.entry.manager,
+            id: self.entry.id.clone(),
+        }
+    }
+}
 
     /// The context page to display in the context drawer.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum ContextPage {
     #[default]
     About,
+    Summoners,
     Logs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     About,
+    Summoners,
     Logs,
 }
 
@@ -708,6 +1221,7 @@ impl menu::action::MenuAction for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
+            MenuAction::Summoners => Message::ToggleContextPage(ContextPage::Summoners),
             MenuAction::Logs => Message::ToggleContextPage(ContextPage::Logs),
         }
     }

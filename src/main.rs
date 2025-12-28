@@ -22,13 +22,11 @@ fn main() -> cosmic::iced::Result {
     i18n::init(&requested_languages);
 
     // Settings for configuring the application window and iced runtime.
-    let settings = cosmic::app::Settings::default()
-        .size((700.0, 640.0).into())
-        .size_limits(
-            cosmic::iced::Limits::NONE
-                .min_width(360.0)
-                .min_height(180.0),
-        );
+    let settings = cosmic::app::Settings::default().size_limits(
+        cosmic::iced::Limits::NONE
+            .min_width(550.0)
+            .min_height(250.0),
+    );
 
     // Starts the application's event loop with `()` as the application's flags.
     cosmic::app::run::<app::AppModel>(settings, ())
