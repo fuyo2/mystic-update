@@ -6,9 +6,9 @@ Mystical Software Updater for Linux Distributions.
 
 ## Installation
 
-This application is programed in [rust-lang/rust][rust] using [pop-os/libcosmic][libcosmic] toolkit:
+This application is programed in [rust](https://github.com/rust-lang/rust) using the [libcosmic](https://github.com/pop-os/libcosmic) toolkit:
 
-A [justfile](./justfile) is included by default for the [casey/just][just] command runner.
+A [justfile](./justfile) is included by default for the [./casey/just][just] command runner.
 
 - `just` builds the application with the default `just build-release` recipe
 - `just run` builds and runs the application
