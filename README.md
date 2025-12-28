@@ -20,7 +20,8 @@ A [justfile](./justfile) is included by default for the [just](https://github.co
 
 ## Features
 
-Easy updates to your Linux system using the following package managers:
+Includes the following features:
+- Easy updates to your Linux system using the following package managers:
     - Apt
     - Brew
     - Dnf
