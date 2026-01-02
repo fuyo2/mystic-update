@@ -8,7 +8,29 @@ Mystical Software Updater for Linux Distributions.
 
 ## Installation
 
-This application is programmed in [rust](https://github.com/rust-lang/rust) using the [libcosmic](https://github.com/pop-os/libcosmic) toolkit:
+This application is programmed in [rust](https://github.com/rust-lang/rust) using the [libcosmic](https://github.com/pop-os/libcosmic) toolkit. Please install rust on our system before continuing.
+
+Install missing system deps
+Ubuntu / Debian / Pop!_OS / Mint:
+```
+sudo apt update
+sudo apt install -y pkg-config libxkbcommon-dev
+```
+
+Fedora:
+```
+sudo dnf install -y pkgconf-pkg-config libxkbcommon-devel
+```
+
+Arch / Manjaro:
+```
+sudo pacman -S --needed pkgconf libxkbcommon
+```
+
+openSUSE:
+```
+sudo zypper install -y pkg-config libxkbcommon-devel
+```
 
 A [justfile](./justfile) is included by default for the [just](https://github.com/casey/just) command runner.
 
