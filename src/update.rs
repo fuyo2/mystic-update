@@ -1119,7 +1119,7 @@ impl DnfYumProgress {
             self.transaction_total = Some(total);
         }
 
-        let progress = self.compute_progress()?;
+        let progress = self.compute_progress()?.min(95.0);
         let progress = progress.max(self.last_progress).clamp(0.0, 100.0);
         if progress > self.last_progress {
             self.last_progress = progress;

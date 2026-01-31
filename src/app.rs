@@ -6,7 +6,7 @@ use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome, Upd
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::Horizontal;
-use cosmic::iced::{Alignment, Background, Color, Length, Subscription};
+use cosmic::iced::{Alignment, Background, Color, Length, Rotation, Subscription};
 use cosmic::widget::{self, about::About, menu};
 use cosmic::{prelude::*, Task};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -324,7 +324,7 @@ impl cosmic::Application for AppModel {
         let updates_section: Element<_> = if self.update_items.is_empty() {
             let updates_content: Element<_> = if self.any_checking() {
                 widget::row::with_capacity(2)
-                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(self.spinner_icon())
                     .push(widget::text::body(fl!("updates-checking")))
                     .align_y(Alignment::Center)
                     .spacing(space_s)
@@ -504,7 +504,7 @@ impl cosmic::Application for AppModel {
             .core()
             .watch_config::<Config>(Self::APP_ID)
             .map(|update| Message::UpdateConfig(update.config))];
-        if self.any_running() {
+        if self.any_running() || self.any_checking() {
             subs.push(
                 cosmic::iced::time::every(Duration::from_millis(
                     RUNNING_PROGRESS_TICK_MS,
@@ -682,8 +682,11 @@ impl cosmic::Application for AppModel {
                 self.config = config;
             }
             Message::ProgressTick => {
-                if self.any_running() {
-                    self.sync_progress_from_tracker();
+                let should_animate = self.any_running() || self.any_checking();
+                if should_animate {
+                    if self.any_running() {
+                        self.sync_progress_from_tracker();
+                    }
                     self.advance_progress_phase();
                 }
             }
@@ -853,7 +856,7 @@ impl AppModel {
         let managers = self.running_manager_summary()?;
         let space_s = cosmic::theme::spacing().space_s;
         let banner = widget::row::with_capacity(2)
-            .push(widget::icon::from_name("process-working-symbolic"))
+            .push(self.spinner_icon())
             .push(widget::text::caption(fl!(
                 "updates-running",
                 managers = managers
@@ -1230,6 +1233,10 @@ impl AppModel {
     }
 
     fn update_progress_value(&self, item: &UpdateItem) -> Option<f32> {
+        if item.entry.id == SYSTEM_UPDATES_ID {
+            return self.system_updates_progress_value(item);
+        }
+
         let Some(state) = self.managers.get(&item.entry.manager) else {
             return None;
         };
@@ -1254,6 +1261,76 @@ impl AppModel {
             Some(progress)
         } else {
             Some(self.running_progress_value())
+        }
+    }
+
+    fn system_updates_progress_value(&self, item: &UpdateItem) -> Option<f32> {
+        let mut contributions: Vec<(f32, f32)> = Vec::new();
+        let mut any_running = false;
+
+        for id in [ManagerId::Dnf, ManagerId::Yum] {
+            let Some(state) = self.managers.get(&id) else {
+                continue;
+            };
+
+            if !self.system_updates_allows_manager(id, item.checked) {
+                continue;
+            }
+
+            if matches!(state.status, TaskStatus::Running) {
+                any_running = true;
+                let progress = state
+                    .progress
+                    .unwrap_or_else(|| self.running_progress_value());
+                contributions.push((self.system_updates_weight(id), progress));
+            } else if matches!(state.status, TaskStatus::Success)
+                && self.manager_run_selection.contains_key(&id)
+            {
+                contributions.push((self.system_updates_weight(id), 100.0));
+            }
+        }
+
+        if !any_running || contributions.is_empty() {
+            return None;
+        }
+
+        let mut total_weight: f32 = contributions.iter().map(|(weight, _)| *weight).sum();
+        if total_weight <= 0.0 {
+            total_weight = contributions.len() as f32;
+        }
+
+        let combined = contributions
+            .iter()
+            .map(|(weight, progress)| weight * progress)
+            .sum::<f32>()
+            / total_weight;
+
+        let mut combined = combined.clamp(0.0, 100.0);
+        if any_running {
+            combined = combined.min(95.0);
+        }
+
+        Some(combined)
+    }
+
+    fn system_updates_allows_manager(&self, id: ManagerId, item_checked: bool) -> bool {
+        match self.manager_run_selection.get(&id) {
+            Some(Some(selection)) => selection.iter().any(|key| key.id == SYSTEM_UPDATES_ID),
+            Some(None) => true,
+            None => item_checked,
+        }
+    }
+
+    fn system_updates_weight(&self, id: ManagerId) -> f32 {
+        let weight = self
+            .system_update_packages
+            .get(&id)
+            .map(|packages| packages.len())
+            .unwrap_or(0) as f32;
+        if weight <= 0.0 {
+            1.0
+        } else {
+            weight
         }
     }
 
@@ -1289,6 +1366,26 @@ impl AppModel {
         let phase = self.progress_phase % cycle;
         let offset = if phase <= span { phase } else { cycle - phase };
         RUNNING_PROGRESS_MIN + offset
+    }
+
+    fn spinner_rotation(&self) -> Rotation {
+        let span = RUNNING_PROGRESS_MAX - RUNNING_PROGRESS_MIN;
+        if span <= 0.0 {
+            return Rotation::from(0.0);
+        }
+        let cycle = span * 2.0;
+        if cycle <= 0.0 {
+            return Rotation::from(0.0);
+        }
+        let phase = (self.progress_phase % cycle) / cycle;
+        Rotation::from(phase * std::f32::consts::TAU)
+    }
+
+    fn spinner_icon(&self) -> widget::icon::Icon {
+        widget::icon::from_name("process-working-symbolic")
+            .size(16)
+            .icon()
+            .rotation(self.spinner_rotation())
     }
 
     fn details_tabs(&self) -> Element<'_, Message> {
@@ -1456,7 +1553,7 @@ impl AppModel {
 
             let status_widget: Element<_> = if state.checking {
                 widget::row::with_capacity(2)
-                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(self.spinner_icon())
                     .push(widget::text::caption(status_label))
                     .align_y(Alignment::Center)
                     .spacing(space_s)

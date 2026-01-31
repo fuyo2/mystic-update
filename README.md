@@ -47,14 +47,14 @@ A [justfile](./justfile) is included by default for the [just](https://github.co
 Includes the following features:
 - Easy updates to your Linux system using the following package managers:
     - Apt
-    - Brew      *** not tested yet. ***
     - Dnf/Yum
-    - Emerge    *** not tested yet. ***
     - Flatpak
-    - Nix-env   *** not tested yet. ***
-    - Pacman    *** not tested yet. ***
-    - Snap      *** not tested yet. ***
-    - Zypper    *** not tested yet. ***
+    - Brew      *** Not Implemented Yet ***
+    - Emerge    *** Not Implemented Yet ***
+    - Nix-env   *** Not Implemented Yet ***
+    - Pacman    *** Not Implemented Yet ***
+    - Snap      *** Not Implemented Yet ***
+    - Zypper    *** Not Implemented Yet ***
 - Capability to install individually selected updates
 - Asks if you want to reboot after updates
 - View update logs from within Mystic Update application
