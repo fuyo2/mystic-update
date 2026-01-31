@@ -1310,7 +1310,7 @@ impl AppModel {
             });
 
         if let Some(app_id) = app_id {
-            return Self::icon_from_name_or_fallback(&app_id, size);
+            return self.icon_from_name_or_fallback(&app_id, size);
         }
 
         widget::icon::from_name("package-x-generic-symbolic")
@@ -1318,14 +1318,30 @@ impl AppModel {
             .icon()
     }
 
-    fn icon_from_name_or_fallback(name: &str, size: u16) -> widget::icon::Icon {
+    fn icon_from_name_or_fallback(&self, name: &str, size: u16) -> widget::icon::Icon {
+        if let Some(scale) = self.icon_scale_factor() {
+            let named = widget::icon::from_name(name).size(size).scale(scale);
+            if named.clone().path().is_some() {
+                return named.icon();
+            }
+        }
+
         let named = widget::icon::from_name(name).size(size);
         if named.clone().path().is_some() {
-            named.icon()
+            return named.icon();
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(size)
+            .icon()
+    }
+
+    fn icon_scale_factor(&self) -> Option<u16> {
+        let scale = self.core.scale_factor();
+        if scale <= 1.0 {
+            None
         } else {
-            widget::icon::from_name("package-x-generic-symbolic")
-                .size(size)
-                .icon()
+            Some(scale.ceil() as u16)
         }
     }
 
