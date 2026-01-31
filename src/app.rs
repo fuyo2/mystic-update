@@ -403,7 +403,11 @@ impl cosmic::Application for AppModel {
                         .push(subtitle)
                         .spacing(space_s / 2);
 
-                    let icon = widget::icon::from_name("package-x-generic-symbolic");
+                    let icon = if item.entry.id == SYSTEM_UPDATES_ID {
+                        widget::icon::from_name("package-x-generic").size(32)
+                    } else {
+                        widget::icon::from_name("package-x-generic-symbolic").size(32)
+                    };
                     let info_row = widget::row::with_capacity(2)
                         .push(icon)
                         .push(text_block)
