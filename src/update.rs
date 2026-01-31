@@ -91,6 +91,7 @@ pub struct UpdatePackage {
     pub name: String,
     pub current_version: Option<String>,
     pub new_version: Option<String>,
+    pub manager: ManagerId,
 }
 
 pub type ProgressTracker = Arc<StdMutex<HashMap<ManagerId, f32>>>;
@@ -1059,6 +1060,7 @@ fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
             name: display_name,
             current_version: None,
             new_version: Some(new_version.to_string()),
+            manager: id,
         });
     }
 

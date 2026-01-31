@@ -14,12 +14,12 @@ Install missing system deps
 Ubuntu / Debian / Pop!_OS / Mint:
 ```
 sudo apt update
-sudo apt install -y pkg-config libxkbcommon-dev
+sudo apt install -y pkg-config libxkbcommon-dev just
 ```
 
 Fedora:
 ```
-sudo dnf install -y pkgconf-pkg-config libxkbcommon-devel
+sudo dnf install -y glib2-devel pkgconf-pkg-config libxkbcommon-devel gcc make flatpak-devel just
 ```
 
 Arch / Manjaro:
@@ -48,13 +48,12 @@ Includes the following features:
 - Easy updates to your Linux system using the following package managers:
     - Apt
     - Brew      *** not tested yet. ***
-    - Dnf       *** not tested yet. ***
+    - Dnf/Yum
     - Emerge    *** not tested yet. ***
     - Flatpak
     - Nix-env   *** not tested yet. ***
     - Pacman    *** not tested yet. ***
     - Snap      *** not tested yet. ***
-    - Yum       *** not tested yet. ***
     - Zypper    *** not tested yet. ***
 - Capability to install individually selected updates
 - Asks if you want to reboot after updates

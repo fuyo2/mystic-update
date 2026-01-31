@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::fl;
-use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome};
+use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome, UpdatePackage};
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::Horizontal;
@@ -19,6 +19,7 @@ const RUNNING_PROGRESS_MIN: f32 = 15.0;
 const RUNNING_PROGRESS_MAX: f32 = 85.0;
 const RUNNING_PROGRESS_STEP: f32 = 3.0;
 const RUNNING_PROGRESS_TICK_MS: u64 = 120;
+const SYSTEM_UPDATES_ID: &str = "system-updates";
 
 #[derive(Clone, Debug)]
 struct ManagerState {
@@ -82,6 +83,8 @@ pub struct AppModel {
     reboot_in_progress: bool,
     /// Parsed update items for supported managers.
     update_items: Vec<UpdateItem>,
+    /// DNF/YUM packages to display as a single system updates card.
+    system_update_packages: HashMap<ManagerId, Vec<UpdatePackage>>,
     /// Selected update for the details panel.
     selected_update: Option<UpdateKey>,
     /// Selected tab for update details.
@@ -197,6 +200,7 @@ impl cosmic::Application for AppModel {
             reboot_prompt: false,
             reboot_in_progress: false,
             update_items: Vec::new(),
+            system_update_packages: HashMap::new(),
             selected_update: None,
             details_tab: DetailsTab::Information,
             show_update_details: false,
@@ -938,6 +942,32 @@ impl AppModel {
     }
 
     fn set_update_entries(&mut self, id: ManagerId, entries: Vec<UpdateEntry>) {
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            let mut packages = Vec::new();
+            for entry in entries {
+                if let Some(entry_packages) = entry.packages {
+                    packages.extend(entry_packages);
+                } else {
+                    packages.push(UpdatePackage {
+                        id: entry.id,
+                        name: entry.name,
+                        current_version: entry.current_version,
+                        new_version: entry.new_version,
+                        manager: id,
+                    });
+                }
+            }
+
+            if packages.is_empty() {
+                self.system_update_packages.remove(&id);
+            } else {
+                self.system_update_packages.insert(id, packages);
+            }
+
+            self.rebuild_system_updates();
+            return;
+        }
+
         self.update_items
             .retain(|item| item.entry.manager != id);
 
@@ -951,7 +981,85 @@ impl AppModel {
         self.prune_selected_update();
     }
 
+    fn rebuild_system_updates(&mut self) {
+        let existing_checked = self
+            .update_items
+            .iter()
+            .find(|item| item.entry.id == SYSTEM_UPDATES_ID)
+            .map(|item| item.checked)
+            .or_else(|| {
+                self.update_items
+                    .iter()
+                    .find(|item| {
+                        matches!(item.entry.manager, ManagerId::Dnf | ManagerId::Yum)
+                    })
+                    .map(|item| item.checked)
+            })
+            .unwrap_or(true);
+
+        let was_selected = self
+            .selected_update
+            .as_ref()
+            .is_some_and(|key| key.id == SYSTEM_UPDATES_ID);
+
+        self.update_items.retain(|item| {
+            !matches!(item.entry.manager, ManagerId::Dnf | ManagerId::Yum)
+                && item.entry.id != SYSTEM_UPDATES_ID
+        });
+
+        let mut combined = Vec::new();
+        for manager in [ManagerId::Dnf, ManagerId::Yum] {
+            if let Some(packages) = self.system_update_packages.get(&manager) {
+                combined.extend(packages.clone());
+            }
+        }
+
+        if combined.is_empty() {
+            self.prune_selected_update();
+            return;
+        }
+
+        let manager_for_update = if self
+            .managers
+            .get(&ManagerId::Dnf)
+            .is_some_and(|state| state.available)
+        {
+            ManagerId::Dnf
+        } else {
+            ManagerId::Yum
+        };
+
+        let entry = UpdateEntry {
+            manager: manager_for_update,
+            id: SYSTEM_UPDATES_ID.to_string(),
+            name: fl!("system-updates"),
+            current_version: None,
+            new_version: None,
+            scope: None,
+            packages: Some(combined),
+        };
+
+        self.update_items.push(UpdateItem {
+            entry,
+            checked: existing_checked,
+        });
+
+        if was_selected {
+            self.selected_update = Some(UpdateKey {
+                manager: manager_for_update,
+                id: SYSTEM_UPDATES_ID.to_string(),
+            });
+        }
+
+        self.prune_selected_update();
+    }
+
     fn remove_completed_updates(&mut self, id: ManagerId) {
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            self.system_update_packages.remove(&ManagerId::Dnf);
+            self.system_update_packages.remove(&ManagerId::Yum);
+        }
+
         let selection = if self.supports_update_selection(id) {
             self.manager_run_selection.remove(&id).unwrap_or(None)
         } else {
@@ -978,6 +1086,21 @@ impl AppModel {
                 .update_items
                 .iter()
                 .any(|item| item.entry.manager == id);
+        }
+
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            if let Some(state) = self.managers.get_mut(&ManagerId::Dnf) {
+                state.update_available = self
+                    .update_items
+                    .iter()
+                    .any(|item| item.entry.manager == ManagerId::Dnf);
+            }
+            if let Some(state) = self.managers.get_mut(&ManagerId::Yum) {
+                state.update_available = self
+                    .update_items
+                    .iter()
+                    .any(|item| item.entry.manager == ManagerId::Yum);
+            }
         }
     }
 
@@ -1036,6 +1159,7 @@ impl AppModel {
                 if let Some(packages) = &item.entry.packages {
                     let mut lines = Vec::with_capacity(packages.len());
                     for package in packages {
+                        let manager_label = package.manager.spec().label;
                         let display_name = if package.name.trim().is_empty() {
                             package.id.as_str()
                         } else {
@@ -1043,10 +1167,12 @@ impl AppModel {
                         };
                         let line = match (&package.current_version, &package.new_version) {
                             (Some(current), Some(new)) => {
-                                format!("{display_name}: {current} -> {new}")
+                                format!("{manager_label}: {display_name} {current} -> {new}")
                             }
-                            (None, Some(new)) => format!("{display_name}: {new}"),
-                            _ => display_name.to_string(),
+                            (None, Some(new)) => {
+                                format!("{manager_label}: {display_name} {new}")
+                            }
+                            _ => format!("{manager_label}: {display_name}"),
                         };
                         lines.push(line);
                     }
@@ -1074,11 +1200,7 @@ impl AppModel {
     fn update_subtitle(entry: &UpdateEntry) -> String {
         let manager = entry.manager.spec().label;
         if let Some(packages) = &entry.packages {
-            return format!(
-                "{} · {}",
-                manager,
-                fl!("updates-packages-count", count = packages.len())
-            );
+            return fl!("updates-packages-count", count = packages.len());
         }
         let current = entry
             .current_version
