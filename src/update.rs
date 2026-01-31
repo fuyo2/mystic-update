@@ -402,6 +402,77 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
     }
 }
 
+async fn run_dnf_yum_selected(
+    id: ManagerId,
+    entries: &[UpdateEntry],
+) -> UpdateOutcome {
+    let spec = id.spec();
+    let mut output = String::new();
+
+    let Some(cmd) = spec.commands.first() else {
+        return UpdateOutcome {
+            output: "No update command configured.\n".to_string(),
+            status: TaskStatus::Failed("Missing update command".to_string()),
+        };
+    };
+
+    let mut package_names: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    package_names.sort();
+    package_names.dedup();
+
+    let mut args: Vec<String> = cmd.args.iter().map(|arg| (*arg).to_string()).collect();
+    args.extend(package_names);
+    let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
+
+    let line = if cmd.requires_privilege {
+        format!("$ pkexec {} {}\n", cmd.program, arg_refs.join(" "))
+    } else {
+        format!("$ {} {}\n", cmd.program, arg_refs.join(" "))
+    };
+    output.push_str(&line);
+
+    match run_command_with_optional_apt_retry(cmd.program, &arg_refs, cmd.requires_privilege).await {
+        Ok(run) => {
+            output.push_str(&String::from_utf8_lossy(&run.bytes));
+            if run.apt_lock {
+                output.push_str(APT_LOCK_ERROR_MESSAGE);
+                output.push('\n');
+                return UpdateOutcome {
+                    output,
+                    status: TaskStatus::Failed(APT_LOCK_ERROR_MESSAGE.to_string()),
+                };
+            }
+            if run.status_code != 0 {
+                let status = format!("Exited with status: {}", run.status_code);
+                output.push_str(&status);
+                output.push('\n');
+                return UpdateOutcome {
+                    output,
+                    status: TaskStatus::Failed(status),
+                };
+            }
+        }
+        Err(err) => {
+            output.push_str(&err);
+            if !err.ends_with('\n') {
+                output.push('\n');
+            }
+            return UpdateOutcome {
+                output,
+                status: TaskStatus::Failed(err),
+            };
+        }
+    }
+
+    UpdateOutcome {
+        output,
+        status: TaskStatus::Success,
+    }
+}
+
 fn report_progress(
     progress: &Option<ProgressTracker>,
     id: ManagerId,
@@ -452,6 +523,12 @@ pub async fn run_manager_with_progress(
             }
             return match entries {
                 Some(entries) => run_flatpak_selected(&entries).await,
+                None => run_manager(id).await,
+            };
+        }
+        ManagerId::Dnf | ManagerId::Yum => {
+            return match entries {
+                Some(entries) => run_dnf_yum_selected(id, &entries).await,
                 None => run_manager(id).await,
             };
         }
@@ -750,6 +827,7 @@ pub fn parse_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
     match id {
         ManagerId::Apt => parse_apt_updates(output),
         ManagerId::Flatpak => parse_flatpak_updates(output),
+        ManagerId::Dnf | ManagerId::Yum => parse_dnf_yum_updates(id, output),
         _ => Vec::new(),
     }
 }
@@ -792,6 +870,53 @@ fn parse_apt_updates(output: &str) -> Vec<UpdateEntry> {
             name,
             current_version,
             new_version,
+            scope: None,
+        });
+    }
+
+    updates
+}
+
+fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
+    let mut updates = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('$')
+            || line.starts_with("Last metadata")
+            || line.starts_with("Updating and loading repositories")
+            || line.starts_with("Repositories loaded")
+            || line.starts_with("Loaded plugins")
+            || line.starts_with("Loading mirror speeds")
+            || line.starts_with("Obsoleting Packages")
+            || line.starts_with("Obsoleting packages")
+            || line.starts_with("Security:")
+            || line.starts_with("Error:")
+            || line.starts_with("==")
+        {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let package = parts[0];
+        let new_version = parts[1];
+
+        let (display_name, id_value) = match split_rpm_name_arch(package) {
+            Some((name, _arch)) => (name.to_string(), package.to_string()),
+            None => continue,
+        };
+
+        updates.push(UpdateEntry {
+            manager: id,
+            id: id_value,
+            name: display_name,
+            current_version: None,
+            new_version: Some(new_version.to_string()),
             scope: None,
         });
     }
@@ -939,6 +1064,35 @@ fn short_commit(commit: &str) -> String {
         short.push(ch);
     }
     short
+}
+
+fn split_rpm_name_arch(value: &str) -> Option<(&str, &str)> {
+    let (name, arch) = value.rsplit_once('.')?;
+    if is_rpm_arch(arch) {
+        Some((name, arch))
+    } else {
+        None
+    }
+}
+
+fn is_rpm_arch(value: &str) -> bool {
+    matches!(
+        value,
+        "noarch"
+            | "x86_64"
+            | "i686"
+            | "i586"
+            | "i386"
+            | "aarch64"
+            | "armv7hl"
+            | "armv7hnl"
+            | "armv7h"
+            | "armv6hl"
+            | "ppc64le"
+            | "ppc64"
+            | "s390x"
+            | "riscv64"
+    )
 }
 
 fn flatpak_app_id_from_ref(ref_id: &str) -> Option<String> {

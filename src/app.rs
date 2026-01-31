@@ -903,7 +903,10 @@ impl AppModel {
     }
 
     fn supports_update_selection(&self, id: ManagerId) -> bool {
-        matches!(id, ManagerId::Apt | ManagerId::Flatpak)
+        matches!(
+            id,
+            ManagerId::Apt | ManagerId::Flatpak | ManagerId::Dnf | ManagerId::Yum
+        )
     }
 
     fn has_selected_updates(&self, id: ManagerId) -> bool {
