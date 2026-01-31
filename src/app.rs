@@ -587,8 +587,12 @@ impl cosmic::Application for AppModel {
                     map.remove(&id);
                 }
 
-                if id == ManagerId::Apt && matches!(outcome.status, TaskStatus::Success) {
-                    self.reboot_prompt = update::apt_has_updates(&outcome.output);
+                if matches!(outcome.status, TaskStatus::Success) {
+                    if id == ManagerId::Apt {
+                        self.reboot_prompt = update::apt_has_updates(&outcome.output);
+                    } else if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+                        self.reboot_prompt = update::dnf_yum_has_updates(&outcome.output);
+                    }
                 }
 
                 if matches!(outcome.status, TaskStatus::Success) && !self.run_all_active {

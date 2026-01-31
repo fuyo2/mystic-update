@@ -966,6 +966,20 @@ pub fn apt_has_updates(output: &str) -> bool {
     false
 }
 
+pub fn dnf_yum_has_updates(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    if lower.contains("nothing to do.") {
+        return false;
+    }
+    if lower.contains("no packages marked for update")
+        || lower.contains("no packages marked for upgrade")
+        || lower.contains("no packages marked for install")
+    {
+        return false;
+    }
+    true
+}
+
 pub fn parse_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
     match id {
         ManagerId::Apt => parse_apt_updates(output),
