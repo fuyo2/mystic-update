@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 
 #[cfg(feature = "flatpak")]
@@ -402,11 +402,6 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
     }
 }
 
-const PULSE_PROGRESS_MIN: f32 = 10.0;
-const PULSE_PROGRESS_MAX: f32 = 90.0;
-const PULSE_PROGRESS_STEP: f32 = 4.0;
-const PULSE_PROGRESS_TICK_MS: u64 = 180;
-
 async fn run_dnf_yum_with_progress(
     id: ManagerId,
     entries: Option<Vec<UpdateEntry>>,
@@ -441,41 +436,19 @@ async fn run_dnf_yum_with_progress(
     };
     output.push_str(&line);
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let progress_task = if progress.is_some() {
-        let progress_clone = progress.clone();
-        let stop_clone = Arc::clone(&stop_flag);
-        Some(tokio::spawn(async move {
-            let mut value = PULSE_PROGRESS_MIN;
-            let mut direction = 1.0_f32;
-            report_progress(&progress_clone, id, value);
-            while !stop_clone.load(Ordering::Relaxed) {
-                sleep(Duration::from_millis(PULSE_PROGRESS_TICK_MS)).await;
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-                value += PULSE_PROGRESS_STEP * direction;
-                if value >= PULSE_PROGRESS_MAX {
-                    value = PULSE_PROGRESS_MAX;
-                    direction = -1.0;
-                } else if value <= PULSE_PROGRESS_MIN {
-                    value = PULSE_PROGRESS_MIN;
-                    direction = 1.0;
-                }
-                report_progress(&progress_clone, id, value);
+    report_progress(&progress, id, 0.0);
+    let mut parser = DnfYumProgress::new();
+    let run_result = run_command_streaming(
+        cmd.program,
+        &arg_refs,
+        cmd.requires_privilege,
+        |line| {
+            if let Some(value) = parser.update_from_line(line) {
+                report_progress(&progress, id, value);
             }
-        }))
-    } else {
-        None
-    };
-
-    let run_result =
-        run_command_with_optional_apt_retry(cmd.program, &arg_refs, cmd.requires_privilege).await;
-
-    stop_flag.store(true, Ordering::Relaxed);
-    if let Some(task) = progress_task {
-        let _ = task.await;
-    }
+        },
+    )
+    .await;
     clear_progress(&progress, id);
 
     match run_result {
@@ -515,6 +488,97 @@ async fn run_dnf_yum_with_progress(
         output,
         status: TaskStatus::Success,
     }
+}
+
+async fn run_command_streaming(
+    program: &str,
+    args: &[&str],
+    requires_privilege: bool,
+    mut on_line: impl FnMut(&str),
+) -> Result<CommandRun, String> {
+    let mut command = if requires_privilege {
+        let mut command = Command::new("pkexec");
+        command.arg(program);
+        command.args(args);
+        command
+    } else {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    };
+
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let stderr = child.stderr.take().ok_or("missing stderr")?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let stdout_tx = tx.clone();
+    let stdout_task = tokio::spawn(async move { forward_stream(stdout, stdout_tx).await });
+
+    let stderr_tx = tx.clone();
+    let stderr_task = tokio::spawn(async move { forward_stream(stderr, stderr_tx).await });
+
+    drop(tx);
+
+    let mut output = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        output.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
+        for segment in text.split('\r') {
+            let segment = segment.trim_end_matches('\n');
+            if !segment.is_empty() {
+                on_line(segment);
+            }
+        }
+    }
+
+    let status = child.wait().await.map_err(|err| err.to_string())?;
+    let status_code = status.code().unwrap_or(1);
+
+    let stdout_result = stdout_task.await.map_err(|err| err.to_string())?;
+    if let Err(err) = stdout_result {
+        return Err(err);
+    }
+    let stderr_result = stderr_task.await.map_err(|err| err.to_string())?;
+    if let Err(err) = stderr_result {
+        return Err(err);
+    }
+
+    Ok(CommandRun {
+        bytes: output,
+        status_code,
+        apt_lock: false,
+    })
+}
+
+async fn forward_stream<R>(
+    reader: R,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut buffer)
+            .await
+            .map_err(|err| err.to_string())?;
+        if bytes_read == 0 {
+            break;
+        }
+        if tx.send(buffer.clone()).is_err() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn report_progress(
@@ -963,6 +1027,119 @@ fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
     }
 
     updates
+}
+
+struct DnfYumProgress {
+    download_current: Option<u32>,
+    download_total: Option<u32>,
+    transaction_current: Option<u32>,
+    transaction_total: Option<u32>,
+    last_progress: f32,
+}
+
+impl DnfYumProgress {
+    fn new() -> Self {
+        Self {
+            download_current: None,
+            download_total: None,
+            transaction_current: None,
+            transaction_total: None,
+            last_progress: 0.0,
+        }
+    }
+
+    fn update_from_line(&mut self, line: &str) -> Option<f32> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (current, total) = parse_ratio_near_slash(trimmed)?;
+        if total == 0 {
+            return None;
+        }
+
+        let current = current.min(total);
+        if is_download_ratio_line(trimmed) {
+            self.download_current = Some(current);
+            self.download_total = Some(total);
+        } else {
+            self.transaction_current = Some(current);
+            self.transaction_total = Some(total);
+        }
+
+        let progress = self.compute_progress()?;
+        let progress = progress.max(self.last_progress).clamp(0.0, 100.0);
+        if progress > self.last_progress {
+            self.last_progress = progress;
+            Some(progress)
+        } else {
+            None
+        }
+    }
+
+    fn compute_progress(&self) -> Option<f32> {
+        if let (Some(current), Some(total)) =
+            (self.transaction_current, self.transaction_total)
+        {
+            let base = if self.download_total.is_some() { 60.0 } else { 0.0 };
+            let span = if self.download_total.is_some() { 40.0 } else { 100.0 };
+            return Some(base + span * (current as f32 / total as f32));
+        }
+
+        if let (Some(current), Some(total)) = (self.download_current, self.download_total) {
+            return Some(60.0 * (current as f32 / total as f32));
+        }
+
+        None
+    }
+}
+
+fn parse_ratio_near_slash(text: &str) -> Option<(u32, u32)> {
+    let slash = text.find('/')?;
+    let left = extract_digits_left(&text[..slash])?;
+    let right = extract_digits_right(&text[slash + 1..])?;
+    let left_value = left.parse().ok()?;
+    let right_value = right.parse().ok()?;
+    Some((left_value, right_value))
+}
+
+fn extract_digits_left(text: &str) -> Option<String> {
+    let mut digits = String::new();
+    for ch in text.chars().rev() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits.chars().rev().collect())
+    }
+}
+
+fn extract_digits_right(text: &str) -> Option<String> {
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            started = true;
+        } else if started {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+fn is_download_ratio_line(line: &str) -> bool {
+    line.trim_start().starts_with('(')
 }
 
 fn parse_flatpak_updates(output: &str) -> Vec<UpdateEntry> {
