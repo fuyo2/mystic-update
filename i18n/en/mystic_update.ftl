@@ -11,6 +11,7 @@ update = Update
 view-log = View Log
 updates-title = Available updates
 updates-selected = { $selected } of { $total } selected
+updates-packages-count = { $count } packages
 updates-check-all = Check all
 updates-uncheck-all = Uncheck all
 column-type = Type

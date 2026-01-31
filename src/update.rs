@@ -82,6 +82,15 @@ pub struct UpdateEntry {
     pub current_version: Option<String>,
     pub new_version: Option<String>,
     pub scope: Option<InstallScope>,
+    pub packages: Option<Vec<UpdatePackage>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdatePackage {
+    pub id: String,
+    pub name: String,
+    pub current_version: Option<String>,
+    pub new_version: Option<String>,
 }
 
 pub type ProgressTracker = Arc<StdMutex<HashMap<ManagerId, f32>>>;
@@ -419,10 +428,16 @@ async fn run_dnf_yum_with_progress(
 
     let mut args: Vec<String> = cmd.args.iter().map(|arg| (*arg).to_string()).collect();
     if let Some(entries) = entries {
-        let mut package_names: Vec<String> = entries
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
+        let mut package_names: Vec<String> = Vec::new();
+        for entry in entries {
+            if let Some(packages) = entry.packages {
+                for package in packages {
+                    package_names.push(package.id);
+                }
+            } else {
+                package_names.push(entry.id);
+            }
+        }
         package_names.sort();
         package_names.dedup();
         args.extend(package_names);
@@ -998,6 +1013,7 @@ fn parse_apt_updates(output: &str) -> Vec<UpdateEntry> {
             current_version,
             new_version,
             scope: None,
+            packages: None,
         });
     }
 
@@ -1005,7 +1021,7 @@ fn parse_apt_updates(output: &str) -> Vec<UpdateEntry> {
 }
 
 fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
-    let mut updates = Vec::new();
+    let mut packages = Vec::new();
 
     for line in output.lines() {
         let line = line.trim();
@@ -1038,17 +1054,28 @@ fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
             None => continue,
         };
 
-        updates.push(UpdateEntry {
-            manager: id,
+        packages.push(UpdatePackage {
             id: id_value,
             name: display_name,
             current_version: None,
             new_version: Some(new_version.to_string()),
-            scope: None,
         });
     }
 
-    updates
+    if packages.is_empty() {
+        return Vec::new();
+    }
+
+    let spec = id.spec();
+    vec![UpdateEntry {
+        manager: id,
+        id: spec.command_name.to_string(),
+        name: spec.label.to_string(),
+        current_version: None,
+        new_version: None,
+        scope: None,
+        packages: Some(packages),
+    }]
 }
 
 struct DnfYumProgress {
@@ -1263,6 +1290,7 @@ fn parse_flatpak_updates(output: &str) -> Vec<UpdateEntry> {
                     current_version,
                     new_version,
                     scope,
+                    packages: None,
                 });
             }
             FlatpakParseMode::None => {}

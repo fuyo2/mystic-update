@@ -1033,6 +1033,25 @@ impl AppModel {
                 info.join("\n")
             }
             DetailsTab::Packages => {
+                if let Some(packages) = &item.entry.packages {
+                    let mut lines = Vec::with_capacity(packages.len());
+                    for package in packages {
+                        let display_name = if package.name.trim().is_empty() {
+                            package.id.as_str()
+                        } else {
+                            package.name.as_str()
+                        };
+                        let line = match (&package.current_version, &package.new_version) {
+                            (Some(current), Some(new)) => {
+                                format!("{display_name}: {current} -> {new}")
+                            }
+                            (None, Some(new)) => format!("{display_name}: {new}"),
+                            _ => display_name.to_string(),
+                        };
+                        lines.push(line);
+                    }
+                    return lines.join("\n");
+                }
                 if item.entry.manager == ManagerId::Flatpak {
                     format!("{}: {}", fl!("details-ref"), item.entry.id.as_str())
                 } else {
@@ -1054,6 +1073,13 @@ impl AppModel {
 
     fn update_subtitle(entry: &UpdateEntry) -> String {
         let manager = entry.manager.spec().label;
+        if let Some(packages) = &entry.packages {
+            return format!(
+                "{} · {}",
+                manager,
+                fl!("updates-packages-count", count = packages.len())
+            );
+        }
         let current = entry
             .current_version
             .clone()
