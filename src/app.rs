@@ -29,6 +29,7 @@ struct ManagerState {
     check_output: String,
     checking: bool,
     update_available: bool,
+    progress: Option<f32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -91,6 +92,8 @@ pub struct AppModel {
     manager_run_selection: HashMap<ManagerId, Option<Vec<UpdateKey>>>,
     /// Animated progress phase for indeterminate update bars.
     progress_phase: f32,
+    /// Shared progress tracker for live update operations.
+    progress_tracker: update::ProgressTracker,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -167,6 +170,7 @@ impl cosmic::Application for AppModel {
                     check_output: String::new(),
                     checking: false,
                     update_available: false,
+                    progress: None,
                 },
             );
         }
@@ -198,6 +202,7 @@ impl cosmic::Application for AppModel {
             show_update_details: false,
             manager_run_selection: HashMap::new(),
             progress_phase: 0.0,
+            progress_tracker: update::new_progress_tracker(),
         };
 
         let set_title = app.update_title();
@@ -568,6 +573,10 @@ impl cosmic::Application for AppModel {
                     if matches!(outcome.status, TaskStatus::Success) {
                         state.update_available = false;
                     }
+                    state.progress = None;
+                }
+                if let Ok(mut map) = self.progress_tracker.lock() {
+                    map.remove(&id);
                 }
 
                 if id == ManagerId::Apt && matches!(outcome.status, TaskStatus::Success) {
@@ -666,6 +675,7 @@ impl cosmic::Application for AppModel {
             }
             Message::ProgressTick => {
                 if self.any_running() {
+                    self.sync_progress_from_tracker();
                     self.advance_progress_phase();
                 }
             }
@@ -692,9 +702,23 @@ impl AppModel {
     }
 
     fn set_running(&mut self, id: ManagerId) {
+        let supports_live = self.supports_live_progress(id);
         if let Some(state) = self.managers.get_mut(&id) {
             state.status = TaskStatus::Running;
             state.last_output = fl!("status-running");
+            state.progress = if supports_live {
+                Some(0.0)
+            } else {
+                None
+            };
+        }
+    }
+
+    fn supports_live_progress(&self, id: ManagerId) -> bool {
+        match id {
+            ManagerId::Apt => cfg!(feature = "packagekit"),
+            ManagerId::Flatpak => cfg!(feature = "flatpak"),
+            _ => false,
         }
     }
 
@@ -704,6 +728,7 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         self.set_running(id);
         let selected = self.selected_updates_for_manager(id);
+        let progress = Some(self.progress_tracker.clone());
         if self.supports_update_selection(id) && !selected.is_empty() {
             let selection = selected
                 .iter()
@@ -713,9 +738,10 @@ impl AppModel {
                 })
                 .collect();
             self.manager_run_selection.insert(id, Some(selection));
-            Task::perform(update::run_manager_selected(id, selected), move |outcome| {
-                Message::UpdateComplete(id, outcome)
-            })
+            Task::perform(
+                update::run_manager_with_progress(id, Some(selected), progress),
+                move |outcome| Message::UpdateComplete(id, outcome),
+            )
             .map(cosmic::Action::App)
         } else {
             if self.supports_update_selection(id) {
@@ -723,9 +749,10 @@ impl AppModel {
             } else {
                 self.manager_run_selection.remove(&id);
             }
-            Task::perform(update::run_manager(id), move |outcome| {
-                Message::UpdateComplete(id, outcome)
-            })
+            Task::perform(
+                update::run_manager_with_progress(id, None, progress),
+                move |outcome| Message::UpdateComplete(id, outcome),
+            )
             .map(cosmic::Action::App)
         }
     }
@@ -1040,17 +1067,44 @@ impl AppModel {
     }
 
     fn update_progress_value(&self, item: &UpdateItem) -> Option<f32> {
-        if !item.checked {
-            return None;
-        }
-
         let Some(state) = self.managers.get(&item.entry.manager) else {
             return None;
         };
 
-        match &state.status {
-            TaskStatus::Running => Some(self.running_progress_value()),
-            _ => None,
+        if !matches!(state.status, TaskStatus::Running) {
+            return None;
+        }
+
+        if let Some(selection) = self
+            .manager_run_selection
+            .get(&item.entry.manager)
+            .and_then(|selection| selection.as_ref())
+        {
+            if !selection.contains(&item.key()) {
+                return None;
+            }
+        } else if !item.checked {
+            return None;
+        }
+
+        if let Some(progress) = state.progress {
+            Some(progress)
+        } else {
+            Some(self.running_progress_value())
+        }
+    }
+
+    fn sync_progress_from_tracker(&mut self) {
+        let Ok(progress_map) = self.progress_tracker.lock() else {
+            return;
+        };
+
+        for (id, state) in self.managers.iter_mut() {
+            if matches!(state.status, TaskStatus::Running) {
+                state.progress = progress_map.get(id).copied();
+            } else {
+                state.progress = None;
+            }
         }
     }
 
