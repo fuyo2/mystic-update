@@ -404,7 +404,7 @@ impl cosmic::Application for AppModel {
                         .spacing(space_s / 2);
 
                     let icon = if item.entry.id == SYSTEM_UPDATES_ID {
-                        widget::icon::from_name("package-x-generic").size(32)
+                        widget::icon::from_name("package-x-generic").size(48)
                     } else {
                         widget::icon::from_name("package-x-generic-symbolic").size(32)
                     };
