@@ -14,12 +14,12 @@ Install missing system deps
 Ubuntu / Debian / Pop!_OS / Mint:
 ```
 sudo apt update
-sudo apt install -y pkg-config libxkbcommon-dev
+sudo apt install -y pkg-config libxkbcommon-dev just
 ```
 
 Fedora:
 ```
-sudo dnf install -y pkgconf-pkg-config libxkbcommon-devel
+sudo dnf install -y glib2-devel pkgconf-pkg-config libxkbcommon-devel gcc make flatpak-devel just
 ```
 
 Arch / Manjaro:
@@ -47,15 +47,14 @@ A [justfile](./justfile) is included by default for the [just](https://github.co
 Includes the following features:
 - Easy updates to your Linux system using the following package managers:
     - Apt
-    - Brew      *** not tested yet. ***
-    - Dnf       *** not tested yet. ***
-    - Emerge    *** not tested yet. ***
+    - Dnf/Yum
     - Flatpak
-    - Nix-env   *** not tested yet. ***
-    - Pacman    *** not tested yet. ***
-    - Snap      *** not tested yet. ***
-    - Yum       *** not tested yet. ***
-    - Zypper    *** not tested yet. ***
+    - Brew      *** Not Implemented Yet ***
+    - Emerge    *** Not Implemented Yet ***
+    - Nix-env   *** Not Implemented Yet ***
+    - Pacman    *** Not Implemented Yet ***
+    - Snap      *** Not Implemented Yet ***
+    - Zypper    *** Not Implemented Yet ***
 - Capability to install individually selected updates
 - Asks if you want to reboot after updates
 - View update logs from within Mystic Update application

@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 
 #[cfg(feature = "flatpak")]
@@ -21,7 +21,7 @@ use std::rc::Rc;
 use packagekit_zbus::{
     PackageKit::PackageKitProxyBlocking,
     Transaction::TransactionProxyBlocking,
-    zbus::blocking::Connection,
+    zbus::blocking::{Connection, Proxy},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -82,6 +82,16 @@ pub struct UpdateEntry {
     pub current_version: Option<String>,
     pub new_version: Option<String>,
     pub scope: Option<InstallScope>,
+    pub packages: Option<Vec<UpdatePackage>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdatePackage {
+    pub id: String,
+    pub name: String,
+    pub current_version: Option<String>,
+    pub new_version: Option<String>,
+    pub manager: ManagerId,
 }
 
 pub type ProgressTracker = Arc<StdMutex<HashMap<ManagerId, f32>>>;
@@ -402,6 +412,213 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
     }
 }
 
+async fn run_dnf_yum_with_progress(
+    id: ManagerId,
+    entries: Option<Vec<UpdateEntry>>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
+    let spec = id.spec();
+    let mut output = String::new();
+
+    let Some(cmd) = spec.commands.first() else {
+        return UpdateOutcome {
+            output: "No update command configured.\n".to_string(),
+            status: TaskStatus::Failed("Missing update command".to_string()),
+        };
+    };
+
+    let mut args: Vec<String> = cmd.args.iter().map(|arg| (*arg).to_string()).collect();
+    if let Some(entries) = entries {
+        let mut package_names: Vec<String> = Vec::new();
+        for entry in entries {
+            if let Some(packages) = entry.packages {
+                for package in packages {
+                    package_names.push(package.id);
+                }
+            } else {
+                package_names.push(entry.id);
+            }
+        }
+        package_names.sort();
+        package_names.dedup();
+        args.extend(package_names);
+    }
+    let mut program = cmd.program;
+    if id == ManagerId::Yum && command_exists("stdbuf").await {
+        let mut wrapped_args = Vec::with_capacity(args.len() + 3);
+        wrapped_args.push("-o0".to_string());
+        wrapped_args.push("-e0".to_string());
+        wrapped_args.push(program.to_string());
+        wrapped_args.extend(args);
+        program = "stdbuf";
+        args = wrapped_args;
+    }
+    let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
+
+    let line = if cmd.requires_privilege {
+        format!("$ pkexec {} {}\n", program, arg_refs.join(" "))
+    } else {
+        format!("$ {} {}\n", program, arg_refs.join(" "))
+    };
+    output.push_str(&line);
+
+    report_progress(&progress, id, 0.0);
+    let mut parser = DnfYumProgress::new();
+    let run_result = run_command_streaming(
+        program,
+        &arg_refs,
+        cmd.requires_privilege,
+        |line| {
+            if let Some(value) = parser.update_from_line(line) {
+                report_progress(&progress, id, value);
+            }
+        },
+    )
+    .await;
+    clear_progress(&progress, id);
+
+    match run_result {
+        Ok(run) => {
+            output.push_str(&String::from_utf8_lossy(&run.bytes));
+            if run.apt_lock {
+                output.push_str(APT_LOCK_ERROR_MESSAGE);
+                output.push('\n');
+                return UpdateOutcome {
+                    output,
+                    status: TaskStatus::Failed(APT_LOCK_ERROR_MESSAGE.to_string()),
+                };
+            }
+            if run.status_code != 0 {
+                let status = format!("Exited with status: {}", run.status_code);
+                output.push_str(&status);
+                output.push('\n');
+                return UpdateOutcome {
+                    output,
+                    status: TaskStatus::Failed(status),
+                };
+            }
+        }
+        Err(err) => {
+            output.push_str(&err);
+            if !err.ends_with('\n') {
+                output.push('\n');
+            }
+            return UpdateOutcome {
+                output,
+                status: TaskStatus::Failed(err),
+            };
+        }
+    }
+
+    UpdateOutcome {
+        output,
+        status: TaskStatus::Success,
+    }
+}
+
+async fn run_command_streaming(
+    program: &str,
+    args: &[&str],
+    requires_privilege: bool,
+    mut on_line: impl FnMut(&str),
+) -> Result<CommandRun, String> {
+    let mut command = if requires_privilege {
+        let mut command = Command::new("pkexec");
+        command.arg(program);
+        command.args(args);
+        command
+    } else {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    };
+
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let stdout = child.stdout.take().ok_or("missing stdout")?;
+    let stderr = child.stderr.take().ok_or("missing stderr")?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    let stdout_tx = tx.clone();
+    let stdout_task = tokio::spawn(async move { forward_stream(stdout, stdout_tx).await });
+
+    let stderr_tx = tx.clone();
+    let stderr_task = tokio::spawn(async move { forward_stream(stderr, stderr_tx).await });
+
+    drop(tx);
+
+    let mut output = Vec::new();
+    let mut pending = String::new();
+    while let Some(chunk) = rx.recv().await {
+        output.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&chunk);
+        pending.push_str(&text);
+        let mut start = 0usize;
+        for (idx, ch) in pending.char_indices() {
+            if ch == '\n' || ch == '\r' {
+                let segment = pending[start..idx].trim();
+                if !segment.is_empty() {
+                    on_line(segment);
+                }
+                start = idx + ch.len_utf8();
+            }
+        }
+        if start > 0 {
+            pending = pending[start..].to_string();
+        }
+    }
+    let trailing = pending.trim();
+    if !trailing.is_empty() {
+        on_line(trailing);
+    }
+
+    let status = child.wait().await.map_err(|err| err.to_string())?;
+    let status_code = status.code().unwrap_or(1);
+
+    let stdout_result = stdout_task.await.map_err(|err| err.to_string())?;
+    if let Err(err) = stdout_result {
+        return Err(err);
+    }
+    let stderr_result = stderr_task.await.map_err(|err| err.to_string())?;
+    if let Err(err) = stderr_result {
+        return Err(err);
+    }
+
+    Ok(CommandRun {
+        bytes: output,
+        status_code,
+        apt_lock: false,
+    })
+}
+
+async fn forward_stream<R>(
+    reader: R,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buffer = [0u8; 8192];
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|err| err.to_string())?;
+        if bytes_read == 0 {
+            break;
+        }
+        if tx.send(buffer[..bytes_read].to_vec()).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn report_progress(
     progress: &Option<ProgressTracker>,
     id: ManagerId,
@@ -454,6 +671,9 @@ pub async fn run_manager_with_progress(
                 Some(entries) => run_flatpak_selected(&entries).await,
                 None => run_manager(id).await,
             };
+        }
+        ManagerId::Dnf | ManagerId::Yum => {
+            return run_dnf_yum_with_progress(id, entries, progress).await;
         }
         _ => run_manager(id).await,
     }
@@ -526,12 +746,51 @@ pub struct CheckOutcome {
 }
 
 pub async fn reboot_system() -> Result<(), String> {
+    let logind_error = {
+        #[cfg(feature = "packagekit")]
+        {
+            match reboot_via_logind().await {
+                Ok(()) => return Ok(()),
+                Err(err) => Some(err),
+            }
+        }
+        #[cfg(not(feature = "packagekit"))]
+        {
+            None
+        }
+    };
+
     let (_, status_code) = run_privileged("systemctl", &["reboot"]).await?;
     if status_code == 0 {
         Ok(())
+    } else if let Some(err) = logind_error {
+        Err(format!("{err}\nreboot failed with status {status_code}"))
     } else {
         Err(format!("reboot failed with status {status_code}"))
     }
+}
+
+#[cfg(feature = "packagekit")]
+async fn reboot_via_logind() -> Result<(), String> {
+    tokio::task::spawn_blocking(reboot_via_logind_blocking)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+#[cfg(feature = "packagekit")]
+fn reboot_via_logind_blocking() -> Result<(), String> {
+    let connection = Connection::system().map_err(|err| err.to_string())?;
+    let proxy = Proxy::new(
+        &connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .map_err(|err| err.to_string())?;
+    let _: () = proxy
+        .call("Reboot", &(true,))
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 async fn command_exists(command_name: &str) -> bool {
@@ -746,10 +1005,25 @@ pub fn apt_has_updates(output: &str) -> bool {
     false
 }
 
+pub fn dnf_yum_has_updates(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    if lower.contains("nothing to do.") {
+        return false;
+    }
+    if lower.contains("no packages marked for update")
+        || lower.contains("no packages marked for upgrade")
+        || lower.contains("no packages marked for install")
+    {
+        return false;
+    }
+    true
+}
+
 pub fn parse_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
     match id {
         ManagerId::Apt => parse_apt_updates(output),
         ManagerId::Flatpak => parse_flatpak_updates(output),
+        ManagerId::Dnf | ManagerId::Yum => parse_dnf_yum_updates(id, output),
         _ => Vec::new(),
     }
 }
@@ -793,10 +1067,183 @@ fn parse_apt_updates(output: &str) -> Vec<UpdateEntry> {
             current_version,
             new_version,
             scope: None,
+            packages: None,
         });
     }
 
     updates
+}
+
+fn parse_dnf_yum_updates(id: ManagerId, output: &str) -> Vec<UpdateEntry> {
+    let mut packages = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with('$')
+            || line.starts_with("Last metadata")
+            || line.starts_with("Updating and loading repositories")
+            || line.starts_with("Repositories loaded")
+            || line.starts_with("Loaded plugins")
+            || line.starts_with("Loading mirror speeds")
+            || line.starts_with("Obsoleting Packages")
+            || line.starts_with("Obsoleting packages")
+            || line.starts_with("Security:")
+            || line.starts_with("Error:")
+            || line.starts_with("==")
+        {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let package = parts[0];
+        let new_version = parts[1];
+
+        let (display_name, id_value) = match split_rpm_name_arch(package) {
+            Some((name, _arch)) => (name.to_string(), package.to_string()),
+            None => continue,
+        };
+
+        packages.push(UpdatePackage {
+            id: id_value,
+            name: display_name,
+            current_version: None,
+            new_version: Some(new_version.to_string()),
+            manager: id,
+        });
+    }
+
+    if packages.is_empty() {
+        return Vec::new();
+    }
+
+    let spec = id.spec();
+    vec![UpdateEntry {
+        manager: id,
+        id: spec.command_name.to_string(),
+        name: spec.label.to_string(),
+        current_version: None,
+        new_version: None,
+        scope: None,
+        packages: Some(packages),
+    }]
+}
+
+struct DnfYumProgress {
+    download_current: Option<u32>,
+    download_total: Option<u32>,
+    transaction_current: Option<u32>,
+    transaction_total: Option<u32>,
+    last_progress: f32,
+}
+
+impl DnfYumProgress {
+    fn new() -> Self {
+        Self {
+            download_current: None,
+            download_total: None,
+            transaction_current: None,
+            transaction_total: None,
+            last_progress: 0.0,
+        }
+    }
+
+    fn update_from_line(&mut self, line: &str) -> Option<f32> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (current, total) = parse_ratio_near_slash(trimmed)?;
+        if total == 0 {
+            return None;
+        }
+
+        let current = current.min(total);
+        if is_download_ratio_line(trimmed) {
+            self.download_current = Some(current);
+            self.download_total = Some(total);
+        } else {
+            self.transaction_current = Some(current);
+            self.transaction_total = Some(total);
+        }
+
+        let progress = self.compute_progress()?.min(95.0);
+        let progress = progress.max(self.last_progress).clamp(0.0, 100.0);
+        if progress > self.last_progress {
+            self.last_progress = progress;
+            Some(progress)
+        } else {
+            None
+        }
+    }
+
+    fn compute_progress(&self) -> Option<f32> {
+        if let (Some(current), Some(total)) =
+            (self.transaction_current, self.transaction_total)
+        {
+            let base = if self.download_total.is_some() { 60.0 } else { 0.0 };
+            let span = if self.download_total.is_some() { 40.0 } else { 100.0 };
+            return Some(base + span * (current as f32 / total as f32));
+        }
+
+        if let (Some(current), Some(total)) = (self.download_current, self.download_total) {
+            return Some(60.0 * (current as f32 / total as f32));
+        }
+
+        None
+    }
+}
+
+fn parse_ratio_near_slash(text: &str) -> Option<(u32, u32)> {
+    let slash = text.find('/')?;
+    let left = extract_digits_left(&text[..slash])?;
+    let right = extract_digits_right(&text[slash + 1..])?;
+    let left_value = left.parse().ok()?;
+    let right_value = right.parse().ok()?;
+    Some((left_value, right_value))
+}
+
+fn extract_digits_left(text: &str) -> Option<String> {
+    let mut digits = String::new();
+    for ch in text.chars().rev() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits.chars().rev().collect())
+    }
+}
+
+fn extract_digits_right(text: &str) -> Option<String> {
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            started = true;
+        } else if started {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+fn is_download_ratio_line(line: &str) -> bool {
+    line.trim_start().starts_with('(')
 }
 
 fn parse_flatpak_updates(output: &str) -> Vec<UpdateEntry> {
@@ -898,6 +1345,7 @@ fn parse_flatpak_updates(output: &str) -> Vec<UpdateEntry> {
                     current_version,
                     new_version,
                     scope,
+                    packages: None,
                 });
             }
             FlatpakParseMode::None => {}
@@ -941,7 +1389,36 @@ fn short_commit(commit: &str) -> String {
     short
 }
 
-fn flatpak_app_id_from_ref(ref_id: &str) -> Option<String> {
+fn split_rpm_name_arch(value: &str) -> Option<(&str, &str)> {
+    let (name, arch) = value.rsplit_once('.')?;
+    if is_rpm_arch(arch) {
+        Some((name, arch))
+    } else {
+        None
+    }
+}
+
+fn is_rpm_arch(value: &str) -> bool {
+    matches!(
+        value,
+        "noarch"
+            | "x86_64"
+            | "i686"
+            | "i586"
+            | "i386"
+            | "aarch64"
+            | "armv7hl"
+            | "armv7hnl"
+            | "armv7h"
+            | "armv6hl"
+            | "ppc64le"
+            | "ppc64"
+            | "s390x"
+            | "riscv64"
+    )
+}
+
+pub fn flatpak_app_id_from_ref(ref_id: &str) -> Option<String> {
     let mut parts = ref_id.split('/');
     let kind = parts.next()?;
     if kind != "app" {
@@ -973,10 +1450,16 @@ async fn run_apt_packagekit(
     progress: Option<ProgressTracker>,
 ) -> UpdateOutcome {
     let package_names = entries.map(|entries| {
-        let mut names: Vec<String> = entries
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries {
+            if let Some(packages) = entry.packages {
+                for package in packages {
+                    names.push(package.id);
+                }
+            } else {
+                names.push(entry.id);
+            }
+        }
         names.sort();
         names.dedup();
         names

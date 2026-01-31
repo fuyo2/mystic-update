@@ -2,11 +2,11 @@
 
 use crate::config::Config;
 use crate::fl;
-use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome};
+use crate::update::{self, ManagerId, TaskStatus, UpdateEntry, UpdateOutcome, UpdatePackage};
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::alignment::Horizontal;
-use cosmic::iced::{Alignment, Background, Color, Length, Subscription};
+use cosmic::iced::{Alignment, Background, Color, Length, Rotation, Subscription};
 use cosmic::widget::{self, about::About, menu};
 use cosmic::{prelude::*, Task};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -19,6 +19,8 @@ const RUNNING_PROGRESS_MIN: f32 = 15.0;
 const RUNNING_PROGRESS_MAX: f32 = 85.0;
 const RUNNING_PROGRESS_STEP: f32 = 3.0;
 const RUNNING_PROGRESS_TICK_MS: u64 = 120;
+const SYSTEM_UPDATES_ID: &str = "system-updates";
+const APT_SYSTEM_UPDATES_ID: &str = "system-updates-apt";
 
 #[derive(Clone, Debug)]
 struct ManagerState {
@@ -82,6 +84,8 @@ pub struct AppModel {
     reboot_in_progress: bool,
     /// Parsed update items for supported managers.
     update_items: Vec<UpdateItem>,
+    /// DNF/YUM packages to display as a single system updates card.
+    system_update_packages: HashMap<ManagerId, Vec<UpdatePackage>>,
     /// Selected update for the details panel.
     selected_update: Option<UpdateKey>,
     /// Selected tab for update details.
@@ -197,6 +201,7 @@ impl cosmic::Application for AppModel {
             reboot_prompt: false,
             reboot_in_progress: false,
             update_items: Vec::new(),
+            system_update_packages: HashMap::new(),
             selected_update: None,
             details_tab: DetailsTab::Information,
             show_update_details: false,
@@ -320,7 +325,7 @@ impl cosmic::Application for AppModel {
         let updates_section: Element<_> = if self.update_items.is_empty() {
             let updates_content: Element<_> = if self.any_checking() {
                 widget::row::with_capacity(2)
-                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(self.spinner_icon())
                     .push(widget::text::body(fl!("updates-checking")))
                     .align_y(Alignment::Center)
                     .spacing(space_s)
@@ -399,7 +404,7 @@ impl cosmic::Application for AppModel {
                         .push(subtitle)
                         .spacing(space_s / 2);
 
-                    let icon = widget::icon::from_name("package-x-generic-symbolic");
+                    let icon = self.update_card_icon(&item.entry);
                     let info_row = widget::row::with_capacity(2)
                         .push(icon)
                         .push(text_block)
@@ -496,7 +501,7 @@ impl cosmic::Application for AppModel {
             .core()
             .watch_config::<Config>(Self::APP_ID)
             .map(|update| Message::UpdateConfig(update.config))];
-        if self.any_running() {
+        if self.any_running() || self.any_checking() {
             subs.push(
                 cosmic::iced::time::every(Duration::from_millis(
                     RUNNING_PROGRESS_TICK_MS,
@@ -579,8 +584,12 @@ impl cosmic::Application for AppModel {
                     map.remove(&id);
                 }
 
-                if id == ManagerId::Apt && matches!(outcome.status, TaskStatus::Success) {
-                    self.reboot_prompt = update::apt_has_updates(&outcome.output);
+                if matches!(outcome.status, TaskStatus::Success) {
+                    if id == ManagerId::Apt {
+                        self.reboot_prompt = update::apt_has_updates(&outcome.output);
+                    } else if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+                        self.reboot_prompt = update::dnf_yum_has_updates(&outcome.output);
+                    }
                 }
 
                 if matches!(outcome.status, TaskStatus::Success) && !self.run_all_active {
@@ -674,8 +683,11 @@ impl cosmic::Application for AppModel {
                 self.config = config;
             }
             Message::ProgressTick => {
-                if self.any_running() {
-                    self.sync_progress_from_tracker();
+                let should_animate = self.any_running() || self.any_checking();
+                if should_animate {
+                    if self.any_running() {
+                        self.sync_progress_from_tracker();
+                    }
                     self.advance_progress_phase();
                 }
             }
@@ -845,7 +857,7 @@ impl AppModel {
         let managers = self.running_manager_summary()?;
         let space_s = cosmic::theme::spacing().space_s;
         let banner = widget::row::with_capacity(2)
-            .push(widget::icon::from_name("process-working-symbolic"))
+            .push(self.spinner_icon())
             .push(widget::text::caption(fl!(
                 "updates-running",
                 managers = managers
@@ -903,7 +915,10 @@ impl AppModel {
     }
 
     fn supports_update_selection(&self, id: ManagerId) -> bool {
-        matches!(id, ManagerId::Apt | ManagerId::Flatpak)
+        matches!(
+            id,
+            ManagerId::Apt | ManagerId::Flatpak | ManagerId::Dnf | ManagerId::Yum
+        )
     }
 
     fn has_selected_updates(&self, id: ManagerId) -> bool {
@@ -935,6 +950,104 @@ impl AppModel {
     }
 
     fn set_update_entries(&mut self, id: ManagerId, entries: Vec<UpdateEntry>) {
+        if id == ManagerId::Apt {
+            let existing_checked = self
+                .update_items
+                .iter()
+                .find(|item| item.entry.id == APT_SYSTEM_UPDATES_ID)
+                .map(|item| item.checked)
+                .or_else(|| {
+                    self.update_items
+                        .iter()
+                        .find(|item| item.entry.manager == ManagerId::Apt)
+                        .map(|item| item.checked)
+                })
+                .unwrap_or(true);
+
+            let was_selected = self
+                .selected_update
+                .as_ref()
+                .is_some_and(|key| key.manager == ManagerId::Apt);
+
+            self.update_items
+                .retain(|item| item.entry.manager != ManagerId::Apt);
+
+            let mut packages = Vec::new();
+            for entry in entries {
+                if let Some(entry_packages) = entry.packages {
+                    packages.extend(entry_packages);
+                } else {
+                    packages.push(UpdatePackage {
+                        id: entry.id,
+                        name: entry.name,
+                        current_version: entry.current_version,
+                        new_version: entry.new_version,
+                        manager: id,
+                    });
+                }
+            }
+
+            if packages.is_empty() {
+                self.prune_selected_update();
+                return;
+            }
+
+            let entry = UpdateEntry {
+                manager: ManagerId::Apt,
+                id: APT_SYSTEM_UPDATES_ID.to_string(),
+                name: format!(
+                    "{} ({})",
+                    fl!("system-updates"),
+                    ManagerId::Apt.spec().label
+                ),
+                current_version: None,
+                new_version: None,
+                scope: None,
+                packages: Some(packages),
+            };
+
+            self.update_items.push(UpdateItem {
+                entry,
+                checked: existing_checked,
+            });
+
+            if was_selected {
+                self.selected_update = Some(UpdateKey {
+                    manager: ManagerId::Apt,
+                    id: APT_SYSTEM_UPDATES_ID.to_string(),
+                });
+            }
+
+            self.prune_selected_update();
+            return;
+        }
+
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            let mut packages = Vec::new();
+            for entry in entries {
+                if let Some(entry_packages) = entry.packages {
+                    packages.extend(entry_packages);
+                } else {
+                    packages.push(UpdatePackage {
+                        id: entry.id,
+                        name: entry.name,
+                        current_version: entry.current_version,
+                        new_version: entry.new_version,
+                        manager: id,
+                    });
+                }
+            }
+
+            if packages.is_empty() {
+                self.system_update_packages.remove(&id);
+            } else {
+                self.system_update_packages.insert(id, packages);
+            }
+
+            self.rebuild_system_updates();
+            return;
+        }
+
         self.update_items
             .retain(|item| item.entry.manager != id);
 
@@ -948,7 +1061,89 @@ impl AppModel {
         self.prune_selected_update();
     }
 
+    fn rebuild_system_updates(&mut self) {
+        let existing_checked = self
+            .update_items
+            .iter()
+            .find(|item| item.entry.id == SYSTEM_UPDATES_ID)
+            .map(|item| item.checked)
+            .or_else(|| {
+                self.update_items
+                    .iter()
+                    .find(|item| {
+                        matches!(item.entry.manager, ManagerId::Dnf | ManagerId::Yum)
+                    })
+                    .map(|item| item.checked)
+            })
+            .unwrap_or(true);
+
+        let was_selected = self
+            .selected_update
+            .as_ref()
+            .is_some_and(|key| key.id == SYSTEM_UPDATES_ID);
+
+        self.update_items.retain(|item| {
+            !matches!(item.entry.manager, ManagerId::Dnf | ManagerId::Yum)
+                && item.entry.id != SYSTEM_UPDATES_ID
+        });
+
+        let mut combined = Vec::new();
+        for manager in [ManagerId::Dnf, ManagerId::Yum] {
+            if let Some(packages) = self.system_update_packages.get(&manager) {
+                combined.extend(packages.clone());
+            }
+        }
+
+        if combined.is_empty() {
+            self.prune_selected_update();
+            return;
+        }
+
+        let manager_for_update = if self
+            .managers
+            .get(&ManagerId::Dnf)
+            .is_some_and(|state| state.available)
+        {
+            ManagerId::Dnf
+        } else {
+            ManagerId::Yum
+        };
+
+        let entry = UpdateEntry {
+            manager: manager_for_update,
+            id: SYSTEM_UPDATES_ID.to_string(),
+            name: format!(
+                "{} ({})",
+                fl!("system-updates"),
+                manager_for_update.spec().label
+            ),
+            current_version: None,
+            new_version: None,
+            scope: None,
+            packages: Some(combined),
+        };
+
+        self.update_items.push(UpdateItem {
+            entry,
+            checked: existing_checked,
+        });
+
+        if was_selected {
+            self.selected_update = Some(UpdateKey {
+                manager: manager_for_update,
+                id: SYSTEM_UPDATES_ID.to_string(),
+            });
+        }
+
+        self.prune_selected_update();
+    }
+
     fn remove_completed_updates(&mut self, id: ManagerId) {
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            self.system_update_packages.remove(&ManagerId::Dnf);
+            self.system_update_packages.remove(&ManagerId::Yum);
+        }
+
         let selection = if self.supports_update_selection(id) {
             self.manager_run_selection.remove(&id).unwrap_or(None)
         } else {
@@ -975,6 +1170,21 @@ impl AppModel {
                 .update_items
                 .iter()
                 .any(|item| item.entry.manager == id);
+        }
+
+        if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
+            if let Some(state) = self.managers.get_mut(&ManagerId::Dnf) {
+                state.update_available = self
+                    .update_items
+                    .iter()
+                    .any(|item| item.entry.manager == ManagerId::Dnf);
+            }
+            if let Some(state) = self.managers.get_mut(&ManagerId::Yum) {
+                state.update_available = self
+                    .update_items
+                    .iter()
+                    .any(|item| item.entry.manager == ManagerId::Yum);
+            }
         }
     }
 
@@ -1030,6 +1240,28 @@ impl AppModel {
                 info.join("\n")
             }
             DetailsTab::Packages => {
+                if let Some(packages) = &item.entry.packages {
+                    let mut lines = Vec::with_capacity(packages.len());
+                    for package in packages {
+                        let manager_label = package.manager.spec().label;
+                        let display_name = if package.name.trim().is_empty() {
+                            package.id.as_str()
+                        } else {
+                            package.name.as_str()
+                        };
+                        let line = match (&package.current_version, &package.new_version) {
+                            (Some(current), Some(new)) => {
+                                format!("{manager_label}: {display_name} {current} -> {new}")
+                            }
+                            (None, Some(new)) => {
+                                format!("{manager_label}: {display_name} {new}")
+                            }
+                            _ => format!("{manager_label}: {display_name}"),
+                        };
+                        lines.push(line);
+                    }
+                    return lines.join("\n");
+                }
                 if item.entry.manager == ManagerId::Flatpak {
                     format!("{}: {}", fl!("details-ref"), item.entry.id.as_str())
                 } else {
@@ -1049,8 +1281,75 @@ impl AppModel {
         }
     }
 
+    fn update_card_icon(&self, entry: &UpdateEntry) -> widget::icon::Icon {
+        if entry.id == SYSTEM_UPDATES_ID || entry.id == APT_SYSTEM_UPDATES_ID {
+            return widget::icon::from_name("package-x-generic")
+                .size(48)
+                .icon();
+        }
+
+        if entry.manager == ManagerId::Flatpak {
+            return self.flatpak_update_icon(entry, 48);
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(32)
+            .icon()
+    }
+
+    fn flatpak_update_icon(&self, entry: &UpdateEntry, size: u16) -> widget::icon::Icon {
+        let app_id = update::flatpak_app_id_from_ref(&entry.id)
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| {
+                let name = entry.name.trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            });
+
+        if let Some(app_id) = app_id {
+            return self.icon_from_name_or_fallback(&app_id, size);
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(size)
+            .icon()
+    }
+
+    fn icon_from_name_or_fallback(&self, name: &str, size: u16) -> widget::icon::Icon {
+        if let Some(scale) = self.icon_scale_factor() {
+            let named = widget::icon::from_name(name).size(size).scale(scale);
+            if named.clone().path().is_some() {
+                return named.icon();
+            }
+        }
+
+        let named = widget::icon::from_name(name).size(size);
+        if named.clone().path().is_some() {
+            return named.icon();
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(size)
+            .icon()
+    }
+
+    fn icon_scale_factor(&self) -> Option<u16> {
+        let scale = self.core.scale_factor();
+        if scale <= 1.0 {
+            None
+        } else {
+            Some(scale.ceil() as u16)
+        }
+    }
+
     fn update_subtitle(entry: &UpdateEntry) -> String {
         let manager = entry.manager.spec().label;
+        if let Some(packages) = &entry.packages {
+            return fl!("updates-packages-count", count = packages.len());
+        }
         let current = entry
             .current_version
             .clone()
@@ -1071,6 +1370,10 @@ impl AppModel {
     }
 
     fn update_progress_value(&self, item: &UpdateItem) -> Option<f32> {
+        if item.entry.id == SYSTEM_UPDATES_ID {
+            return self.system_updates_progress_value(item);
+        }
+
         let Some(state) = self.managers.get(&item.entry.manager) else {
             return None;
         };
@@ -1095,6 +1398,76 @@ impl AppModel {
             Some(progress)
         } else {
             Some(self.running_progress_value())
+        }
+    }
+
+    fn system_updates_progress_value(&self, item: &UpdateItem) -> Option<f32> {
+        let mut contributions: Vec<(f32, f32)> = Vec::new();
+        let mut any_running = false;
+
+        for id in [ManagerId::Dnf, ManagerId::Yum] {
+            let Some(state) = self.managers.get(&id) else {
+                continue;
+            };
+
+            if !self.system_updates_allows_manager(id, item.checked) {
+                continue;
+            }
+
+            if matches!(state.status, TaskStatus::Running) {
+                any_running = true;
+                let progress = state
+                    .progress
+                    .unwrap_or_else(|| self.running_progress_value());
+                contributions.push((self.system_updates_weight(id), progress));
+            } else if matches!(state.status, TaskStatus::Success)
+                && self.manager_run_selection.contains_key(&id)
+            {
+                contributions.push((self.system_updates_weight(id), 100.0));
+            }
+        }
+
+        if !any_running || contributions.is_empty() {
+            return None;
+        }
+
+        let mut total_weight: f32 = contributions.iter().map(|(weight, _)| *weight).sum();
+        if total_weight <= 0.0 {
+            total_weight = contributions.len() as f32;
+        }
+
+        let combined = contributions
+            .iter()
+            .map(|(weight, progress)| weight * progress)
+            .sum::<f32>()
+            / total_weight;
+
+        let mut combined = combined.clamp(0.0, 100.0);
+        if any_running {
+            combined = combined.min(95.0);
+        }
+
+        Some(combined)
+    }
+
+    fn system_updates_allows_manager(&self, id: ManagerId, item_checked: bool) -> bool {
+        match self.manager_run_selection.get(&id) {
+            Some(Some(selection)) => selection.iter().any(|key| key.id == SYSTEM_UPDATES_ID),
+            Some(None) => true,
+            None => item_checked,
+        }
+    }
+
+    fn system_updates_weight(&self, id: ManagerId) -> f32 {
+        let weight = self
+            .system_update_packages
+            .get(&id)
+            .map(|packages| packages.len())
+            .unwrap_or(0) as f32;
+        if weight <= 0.0 {
+            1.0
+        } else {
+            weight
         }
     }
 
@@ -1130,6 +1503,26 @@ impl AppModel {
         let phase = self.progress_phase % cycle;
         let offset = if phase <= span { phase } else { cycle - phase };
         RUNNING_PROGRESS_MIN + offset
+    }
+
+    fn spinner_rotation(&self) -> Rotation {
+        let span = RUNNING_PROGRESS_MAX - RUNNING_PROGRESS_MIN;
+        if span <= 0.0 {
+            return Rotation::from(0.0);
+        }
+        let cycle = span * 2.0;
+        if cycle <= 0.0 {
+            return Rotation::from(0.0);
+        }
+        let phase = (self.progress_phase % cycle) / cycle;
+        Rotation::from(phase * std::f32::consts::TAU)
+    }
+
+    fn spinner_icon(&self) -> widget::icon::Icon {
+        widget::icon::from_name("process-working-symbolic")
+            .size(16)
+            .icon()
+            .rotation(self.spinner_rotation())
     }
 
     fn details_tabs(&self) -> Element<'_, Message> {
@@ -1297,7 +1690,7 @@ impl AppModel {
 
             let status_widget: Element<_> = if state.checking {
                 widget::row::with_capacity(2)
-                    .push(widget::icon::from_name("process-working-symbolic"))
+                    .push(self.spinner_icon())
                     .push(widget::text::caption(status_label))
                     .align_y(Alignment::Center)
                     .spacing(space_s)
