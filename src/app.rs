@@ -844,15 +844,19 @@ impl AppModel {
     fn running_updates_banner(&self) -> Option<Element<'_, Message>> {
         let managers = self.running_manager_summary()?;
         let space_s = cosmic::theme::spacing().space_s;
+        let banner = widget::row::with_capacity(2)
+            .push(widget::icon::from_name("process-working-symbolic"))
+            .push(widget::text::caption(fl!(
+                "updates-running",
+                managers = managers
+            )))
+            .align_y(Alignment::Center)
+            .spacing(space_s / 2);
+
         Some(
-            widget::row::with_capacity(2)
-                .push(widget::icon::from_name("process-working-symbolic"))
-                .push(widget::text::caption(fl!(
-                    "updates-running",
-                    managers = managers
-                )))
-                .align_y(Alignment::Center)
-                .spacing(space_s / 2)
+            widget::container(banner)
+                .width(Length::Fill)
+                .align_x(Horizontal::Center)
                 .into(),
         )
     }
