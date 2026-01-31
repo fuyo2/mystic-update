@@ -20,6 +20,7 @@ const RUNNING_PROGRESS_MAX: f32 = 85.0;
 const RUNNING_PROGRESS_STEP: f32 = 3.0;
 const RUNNING_PROGRESS_TICK_MS: u64 = 120;
 const SYSTEM_UPDATES_ID: &str = "system-updates";
+const APT_SYSTEM_UPDATES_ID: &str = "system-updates-apt";
 
 #[derive(Clone, Debug)]
 struct ManagerState {
@@ -403,11 +404,7 @@ impl cosmic::Application for AppModel {
                         .push(subtitle)
                         .spacing(space_s / 2);
 
-                    let icon = if item.entry.id == SYSTEM_UPDATES_ID {
-                        widget::icon::from_name("package-x-generic").size(48)
-                    } else {
-                        widget::icon::from_name("package-x-generic-symbolic").size(32)
-                    };
+                    let icon = self.update_card_icon(&item.entry);
                     let info_row = widget::row::with_capacity(2)
                         .push(icon)
                         .push(text_block)
@@ -953,6 +950,78 @@ impl AppModel {
     }
 
     fn set_update_entries(&mut self, id: ManagerId, entries: Vec<UpdateEntry>) {
+        if id == ManagerId::Apt {
+            let existing_checked = self
+                .update_items
+                .iter()
+                .find(|item| item.entry.id == APT_SYSTEM_UPDATES_ID)
+                .map(|item| item.checked)
+                .or_else(|| {
+                    self.update_items
+                        .iter()
+                        .find(|item| item.entry.manager == ManagerId::Apt)
+                        .map(|item| item.checked)
+                })
+                .unwrap_or(true);
+
+            let was_selected = self
+                .selected_update
+                .as_ref()
+                .is_some_and(|key| key.manager == ManagerId::Apt);
+
+            self.update_items
+                .retain(|item| item.entry.manager != ManagerId::Apt);
+
+            let mut packages = Vec::new();
+            for entry in entries {
+                if let Some(entry_packages) = entry.packages {
+                    packages.extend(entry_packages);
+                } else {
+                    packages.push(UpdatePackage {
+                        id: entry.id,
+                        name: entry.name,
+                        current_version: entry.current_version,
+                        new_version: entry.new_version,
+                        manager: id,
+                    });
+                }
+            }
+
+            if packages.is_empty() {
+                self.prune_selected_update();
+                return;
+            }
+
+            let entry = UpdateEntry {
+                manager: ManagerId::Apt,
+                id: APT_SYSTEM_UPDATES_ID.to_string(),
+                name: format!(
+                    "{} ({})",
+                    fl!("system-updates"),
+                    ManagerId::Apt.spec().label
+                ),
+                current_version: None,
+                new_version: None,
+                scope: None,
+                packages: Some(packages),
+            };
+
+            self.update_items.push(UpdateItem {
+                entry,
+                checked: existing_checked,
+            });
+
+            if was_selected {
+                self.selected_update = Some(UpdateKey {
+                    manager: ManagerId::Apt,
+                    id: APT_SYSTEM_UPDATES_ID.to_string(),
+                });
+            }
+
+            self.prune_selected_update();
+            return;
+        }
+
         if matches!(id, ManagerId::Dnf | ManagerId::Yum) {
             let mut packages = Vec::new();
             for entry in entries {
@@ -1209,6 +1278,54 @@ impl AppModel {
             entry.id.as_str()
         } else {
             name
+        }
+    }
+
+    fn update_card_icon(&self, entry: &UpdateEntry) -> widget::icon::Icon {
+        if entry.id == SYSTEM_UPDATES_ID || entry.id == APT_SYSTEM_UPDATES_ID {
+            return widget::icon::from_name("package-x-generic")
+                .size(48)
+                .icon();
+        }
+
+        if entry.manager == ManagerId::Flatpak {
+            return self.flatpak_update_icon(entry);
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(32)
+            .icon()
+    }
+
+    fn flatpak_update_icon(&self, entry: &UpdateEntry) -> widget::icon::Icon {
+        let app_id = update::flatpak_app_id_from_ref(&entry.id)
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| {
+                let name = entry.name.trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                }
+            });
+
+        if let Some(app_id) = app_id {
+            return Self::icon_from_name_or_fallback(&app_id, 32);
+        }
+
+        widget::icon::from_name("package-x-generic-symbolic")
+            .size(32)
+            .icon()
+    }
+
+    fn icon_from_name_or_fallback(name: &str, size: u16) -> widget::icon::Icon {
+        let named = widget::icon::from_name(name).size(size);
+        if named.clone().path().is_some() {
+            named.icon()
+        } else {
+            widget::icon::from_name("package-x-generic-symbolic")
+                .size(size)
+                .icon()
         }
     }
 

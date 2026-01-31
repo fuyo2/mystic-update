@@ -1379,7 +1379,7 @@ fn is_rpm_arch(value: &str) -> bool {
     )
 }
 
-fn flatpak_app_id_from_ref(ref_id: &str) -> Option<String> {
+pub fn flatpak_app_id_from_ref(ref_id: &str) -> Option<String> {
     let mut parts = ref_id.split('/');
     let kind = parts.next()?;
     if kind != "app" {
@@ -1411,10 +1411,16 @@ async fn run_apt_packagekit(
     progress: Option<ProgressTracker>,
 ) -> UpdateOutcome {
     let package_names = entries.map(|entries| {
-        let mut names: Vec<String> = entries
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries {
+            if let Some(packages) = entry.packages {
+                for package in packages {
+                    names.push(package.id);
+                }
+            } else {
+                names.push(entry.id);
+            }
+        }
         names.sort();
         names.dedup();
         names
