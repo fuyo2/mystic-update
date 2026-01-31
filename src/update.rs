@@ -2,11 +2,27 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+
+#[cfg(feature = "flatpak")]
+use libflatpak::{gio::Cancellable, glib, prelude::*, Installation, Ref, Transaction};
+#[cfg(feature = "flatpak")]
+use std::cell::{Cell, RefCell};
+#[cfg(feature = "flatpak")]
+use std::ptr;
+#[cfg(feature = "flatpak")]
+use std::rc::Rc;
+
+#[cfg(feature = "packagekit")]
+use packagekit_zbus::{
+    PackageKit::PackageKitProxyBlocking,
+    Transaction::TransactionProxyBlocking,
+    zbus::blocking::Connection,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum ManagerId {
@@ -66,6 +82,12 @@ pub struct UpdateEntry {
     pub current_version: Option<String>,
     pub new_version: Option<String>,
     pub scope: Option<InstallScope>,
+}
+
+pub type ProgressTracker = Arc<StdMutex<HashMap<ManagerId, f32>>>;
+
+pub fn new_progress_tracker() -> ProgressTracker {
+    Arc::new(StdMutex::new(HashMap::new()))
 }
 
 const FLATPAK_COMMANDS: &[CommandSpec] = &[
@@ -380,10 +402,59 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
     }
 }
 
-pub async fn run_manager_selected(id: ManagerId, entries: Vec<UpdateEntry>) -> UpdateOutcome {
+fn report_progress(
+    progress: &Option<ProgressTracker>,
+    id: ManagerId,
+    value: f32,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut map) = progress.lock() {
+        map.insert(id, value.clamp(0.0, 100.0));
+    }
+}
+
+fn clear_progress(progress: &Option<ProgressTracker>, id: ManagerId) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut map) = progress.lock() {
+        map.remove(&id);
+    }
+}
+
+pub async fn run_manager_with_progress(
+    id: ManagerId,
+    entries: Option<Vec<UpdateEntry>>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
     match id {
-        ManagerId::Apt => run_apt_selected(&entries).await,
-        ManagerId::Flatpak => run_flatpak_selected(&entries).await,
+        ManagerId::Apt => {
+            #[cfg(feature = "packagekit")]
+            {
+                return run_apt_packagekit(entries, progress).await;
+            }
+            #[cfg(not(feature = "packagekit"))]
+            {
+                return match entries {
+                    Some(_) => run_manager(id).await,
+                    None => run_manager(id).await,
+                };
+            }
+        }
+        ManagerId::Flatpak => {
+            #[cfg(feature = "flatpak")]
+            {
+                if let Some(entries) = entries {
+                    return run_flatpak_libflatpak(entries, progress).await;
+                }
+            }
+            return match entries {
+                Some(entries) => run_flatpak_selected(&entries).await,
+                None => run_manager(id).await,
+            };
+        }
         _ => run_manager(id).await,
     }
 }
@@ -392,6 +463,11 @@ pub async fn check_manager(id: ManagerId, force_privileged: bool) -> CheckOutcom
     let spec = id.spec();
     let mut output = String::new();
     let mut last_status = 0;
+    let force_privileged = if id == ManagerId::Apt && cfg!(feature = "packagekit") {
+        false
+    } else {
+        force_privileged
+    };
 
     for cmd in spec.check_commands {
         let line = format!("$ {} {}\n", cmd.program, cmd.args.join(" "));
@@ -891,58 +967,523 @@ fn has_non_empty_payload(output: &str) -> bool {
         .any(|line| !line.contains("No updates") && !line.contains("Nothing to do."))
 }
 
-async fn run_apt_selected(entries: &[UpdateEntry]) -> UpdateOutcome {
-    let mut packages: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| {
-            if entry.manager == ManagerId::Apt {
-                Some(entry.id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+#[cfg(feature = "packagekit")]
+async fn run_apt_packagekit(
+    entries: Option<Vec<UpdateEntry>>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
+    let package_names = entries.map(|entries| {
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    });
+    let progress_clone = progress.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        packagekit_update_blocking(package_names, progress_clone)
+    })
+    .await;
 
-    packages.sort();
-    packages.dedup();
+    match result {
+        Ok(outcome) => outcome,
+        Err(err) => UpdateOutcome {
+            output: format!("PackageKit update task failed: {err}"),
+            status: TaskStatus::Failed(err.to_string()),
+        },
+    }
+}
 
-    if packages.is_empty() {
+#[cfg(feature = "packagekit")]
+fn packagekit_update_blocking(
+    package_names: Option<Vec<String>>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
+    let mut output = String::new();
+    output.push_str("$ packagekit update\n");
+
+    let mut client = match PackageKitClient::new() {
+        Ok(client) => client,
+        Err(err) => {
+            output.push_str(&err);
+            output.push('\n');
+            return UpdateOutcome {
+                output,
+                status: TaskStatus::Failed(err),
+            };
+        }
+    };
+
+    let update_ids = match client.collect_update_ids(package_names.as_ref()) {
+        Ok(ids) => ids,
+        Err(err) => {
+            output.push_str(&err);
+            output.push('\n');
+            return UpdateOutcome {
+                output,
+                status: TaskStatus::Failed(err),
+            };
+        }
+    };
+
+    if update_ids.is_empty() {
+        output.push_str("No updates available.\n");
+        clear_progress(&progress, ManagerId::Apt);
         return UpdateOutcome {
-            output: "No APT updates selected.\n".to_string(),
+            output,
+            status: TaskStatus::Success,
+        };
+    }
+
+    report_progress(&progress, ManagerId::Apt, 0.0);
+
+    let update_result = client.run_update(&update_ids, |percent| {
+        report_progress(&progress, ManagerId::Apt, percent as f32);
+    });
+
+    match update_result {
+        Ok(()) => {
+            report_progress(&progress, ManagerId::Apt, 100.0);
+            output.push_str(&format!(
+                "{} upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+                update_ids.len()
+            ));
+            UpdateOutcome {
+                output,
+                status: TaskStatus::Success,
+            }
+        }
+        Err(err) => {
+            output.push_str(&err);
+            output.push('\n');
+            clear_progress(&progress, ManagerId::Apt);
+            UpdateOutcome {
+                output,
+                status: TaskStatus::Failed(err),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "packagekit")]
+struct PackageKitClient {
+    connection: Connection,
+}
+
+#[cfg(feature = "packagekit")]
+impl PackageKitClient {
+    fn new() -> Result<Self, String> {
+        let connection = Connection::system().map_err(|err| err.to_string())?;
+        Ok(Self { connection })
+    }
+
+    fn transaction(&self) -> Result<TransactionProxyBlocking<'_>, String> {
+        let pk = PackageKitProxyBlocking::new(&self.connection)
+            .map_err(|err| err.to_string())?;
+        let tx_path = pk.create_transaction().map_err(|err| err.to_string())?;
+        TransactionProxyBlocking::builder(&self.connection)
+            .destination("org.freedesktop.PackageKit")
+            .map_err(|err| err.to_string())?
+            .path(tx_path)
+            .map_err(|err| err.to_string())?
+            .build()
+            .map_err(|err| err.to_string())
+    }
+
+    fn collect_update_ids(
+        &mut self,
+        filter_names: Option<&Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        let tx = self.transaction()?;
+        tx.get_updates(FilterKind::None as u64)
+            .map_err(|err| err.to_string())?;
+        let packages = transaction_collect_packages(tx)?;
+        let mut ids = Vec::new();
+        let name_filter = filter_names.map(|names| {
+            names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<std::collections::HashSet<_>>()
+        });
+
+        for package in packages {
+            let name = package.package_id.split(';').next().unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(filter) = &name_filter {
+                if !filter.contains(name) {
+                    continue;
+                }
+            }
+            ids.push(package.package_id);
+        }
+
+        ids.sort();
+        ids.dedup();
+
+        if let Some(filter) = name_filter {
+            if ids.is_empty() && !filter.is_empty() {
+                return Err("No updates selected.".to_string());
+            }
+        }
+
+        Ok(ids)
+    }
+
+    fn run_update(
+        &mut self,
+        package_ids: &[String],
+        mut on_progress: impl FnMut(u32),
+    ) -> Result<(), String> {
+        let tx = self.transaction()?;
+        tx.set_hints(&["interactive=true"])
+            .map_err(|err| err.to_string())?;
+        let id_refs: Vec<&str> = package_ids.iter().map(|id| id.as_str()).collect();
+        tx.update_packages(TransactionFlag::OnlyTrusted as u64, &id_refs)
+            .map_err(|err| err.to_string())?;
+        transaction_run_with_progress(tx, |percent| on_progress(percent))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "packagekit")]
+#[allow(dead_code)]
+#[repr(u64)]
+enum FilterKind {
+    None = 1 << 1,
+}
+
+#[cfg(feature = "packagekit")]
+#[allow(dead_code)]
+#[repr(u64)]
+enum TransactionFlag {
+    OnlyTrusted = 1 << 1,
+}
+
+#[cfg(feature = "packagekit")]
+struct TransactionPackage {
+    package_id: String,
+}
+
+#[cfg(feature = "packagekit")]
+fn transaction_collect_packages(
+    tx: TransactionProxyBlocking,
+) -> Result<Vec<TransactionPackage>, String> {
+    let mut packages = Vec::new();
+    for signal in tx.receive_all_signals().map_err(|err| err.to_string())? {
+        if let Some(member) = signal.member() {
+            match member.as_str() {
+                "Package" => {
+                    let (_info, package_id, _summary) =
+                        signal.body::<(u32, String, String)>().map_err(|err| err.to_string())?;
+                    packages.push(TransactionPackage { package_id });
+                }
+                "ErrorCode" => {
+                    let (code, details) =
+                        signal.body::<(u32, String)>().map_err(|err| err.to_string())?;
+                    if code != 48 {
+                        return Err(format!("{details} (code {code})"));
+                    }
+                }
+                "Finished" => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(packages)
+}
+
+#[cfg(feature = "packagekit")]
+fn transaction_run_with_progress(
+    tx: TransactionProxyBlocking,
+    mut on_progress: impl FnMut(u32),
+) -> Result<(), String> {
+    for signal in tx.receive_all_signals().map_err(|err| err.to_string())? {
+        if let Some(member) = signal.member() {
+            match member.as_str() {
+                "ItemProgress" => {
+                    let (_package_id, _status, percentage) =
+                        signal.body::<(String, u32, u32)>().map_err(|err| err.to_string())?;
+                    let total_percentage = tx.percentage().unwrap_or(percentage);
+                    on_progress(total_percentage);
+                }
+                "ErrorCode" => {
+                    let (code, details) =
+                        signal.body::<(u32, String)>().map_err(|err| err.to_string())?;
+                    if code != 48 {
+                        return Err(format!("{details} (code {code})"));
+                    }
+                }
+                "Finished" => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "flatpak")]
+async fn run_flatpak_libflatpak(
+    entries: Vec<UpdateEntry>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
+    let progress_clone = progress.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        flatpak_update_blocking(entries, progress_clone)
+    })
+    .await;
+
+    match result {
+        Ok(outcome) => outcome,
+        Err(err) => UpdateOutcome {
+            output: format!("Flatpak update task failed: {err}"),
+            status: TaskStatus::Failed(err.to_string()),
+        },
+    }
+}
+
+#[cfg(feature = "flatpak")]
+fn flatpak_update_blocking(
+    entries: Vec<UpdateEntry>,
+    progress: Option<ProgressTracker>,
+) -> UpdateOutcome {
+    let mut output = String::new();
+    output.push_str("$ flatpak update (libflatpak)\n");
+
+    let mut user_refs = Vec::new();
+    let mut system_refs = Vec::new();
+    let mut unknown_refs = Vec::new();
+
+    for entry in entries {
+        if entry.manager != ManagerId::Flatpak {
+            continue;
+        }
+        match entry.scope {
+            Some(InstallScope::User) => user_refs.push(entry.id),
+            Some(InstallScope::System) => system_refs.push(entry.id),
+            None => unknown_refs.push(entry.id),
+        }
+    }
+
+    for refs in [&mut user_refs, &mut system_refs, &mut unknown_refs] {
+        refs.sort();
+        refs.dedup();
+    }
+
+    let mut groups = Vec::new();
+    if !user_refs.is_empty() {
+        groups.push(FlatpakGroup {
+            user: true,
+            refs: user_refs,
+        });
+    }
+    if !system_refs.is_empty() {
+        groups.push(FlatpakGroup {
+            user: false,
+            refs: system_refs,
+        });
+    }
+    if !unknown_refs.is_empty() {
+        groups.push(FlatpakGroup {
+            user: true,
+            refs: unknown_refs.clone(),
+        });
+        groups.push(FlatpakGroup {
+            user: false,
+            refs: unknown_refs,
+        });
+    }
+
+    if groups.is_empty() {
+        output.push_str("No Flatpak updates selected.\n");
+        return UpdateOutcome {
+            output,
             status: TaskStatus::Failed("No updates selected".to_string()),
         };
     }
 
-    let mut output = String::new();
+    let total_groups = groups.len() as f32;
+    for (index, group) in groups.into_iter().enumerate() {
+        let group_span = 100.0 / total_groups;
+        let group_start = group_span * index as f32;
+        let progress = progress.clone();
+        let progress_for_report = progress.clone();
+        let report = Rc::new(RefCell::new(Box::new(move |value: f32| {
+            let clamped = value.clamp(0.0, 100.0);
+            let scaled = group_start + (clamped / 100.0) * group_span;
+            report_progress(&progress_for_report, ManagerId::Flatpak, scaled);
+        }) as Box<dyn FnMut(f32)>));
 
-    let update_args = vec!["update".to_string()];
-    if let Err(err) = run_command_logged(
-        &mut output,
-        "apt-get",
-        update_args,
-        true,
-    )
-    .await
-    {
-        return UpdateOutcome {
-            output,
-            status: TaskStatus::Failed(err),
+        if let Ok(mut callback) = report.try_borrow_mut() {
+            callback(0.0);
+        }
+
+        let added = match run_flatpak_group(&group, report.clone()) {
+            Ok(added) => added,
+            Err(err) => {
+                output.push_str(&err);
+                output.push('\n');
+                clear_progress(&progress, ManagerId::Flatpak);
+                return UpdateOutcome {
+                    output,
+                    status: TaskStatus::Failed(err),
+                };
+            }
         };
+
+        if added > 0 {
+            let scope_label = if group.user { "user" } else { "system" };
+            output.push_str(&format!(
+                "Updated {added} Flatpak refs ({scope_label}).\n"
+            ));
+        }
+
+        if let Ok(mut callback) = report.try_borrow_mut() {
+            callback(100.0);
+        }
     }
 
-    let mut install_args = vec!["install".to_string(), "-y".to_string()];
-    install_args.extend(packages);
-
-    match run_command_logged(&mut output, "apt-get", install_args, true).await {
-        Ok(()) => UpdateOutcome {
-            output,
-            status: TaskStatus::Success,
-        },
-        Err(err) => UpdateOutcome {
-            output,
-            status: TaskStatus::Failed(err),
-        },
+    report_progress(&progress, ManagerId::Flatpak, 100.0);
+    UpdateOutcome {
+        output,
+        status: TaskStatus::Success,
     }
+}
+
+#[cfg(feature = "flatpak")]
+struct FlatpakGroup {
+    user: bool,
+    refs: Vec<String>,
+}
+
+#[cfg(feature = "flatpak")]
+fn run_flatpak_group(
+    group: &FlatpakGroup,
+    progress_cb: Rc<RefCell<Box<dyn FnMut(f32)>>>,
+) -> Result<usize, String> {
+    let inst = if group.user {
+        Installation::new_user(Cancellable::NONE)
+    } else {
+        Installation::new_system(Cancellable::NONE)
+    }
+    .map_err(|err| err.to_string())?;
+
+    let tx = Transaction::for_installation(&inst, Cancellable::NONE)
+        .map_err(|err| err.to_string())?;
+
+    attach_flatpak_progress(&tx, progress_cb);
+
+    let added = add_flatpak_updates(&inst, &tx, &group.refs)?;
+    if added == 0 {
+        return Ok(0);
+    }
+
+    tx.run(Cancellable::NONE).map_err(|err| err.to_string())?;
+    Ok(added)
+}
+
+#[cfg(feature = "flatpak")]
+fn attach_flatpak_progress(
+    tx: &Transaction,
+    progress_cb: Rc<RefCell<Box<dyn FnMut(f32)>>>,
+) {
+    let total_ops = Rc::new(Cell::new(0));
+    tx.connect_ready({
+        let total_ops = total_ops.clone();
+        move |tx| {
+            total_ops.set(tx.operations().len());
+            true
+        }
+    });
+    let started_ops = Rc::new(Cell::new(0));
+    tx.connect_new_operation(move |_, _op, progress| {
+        let current_op = started_ops.get();
+        started_ops.set(current_op + 1);
+        let progress_per_op = 100.0 / (total_ops.get().max(started_ops.get()) as f32);
+        let progress_cb = progress_cb.clone();
+        progress.connect_changed(move |progress| {
+            let op_progress = (progress.progress() as f32) / 100.0;
+            let total_progress = ((current_op as f32) + op_progress) * progress_per_op;
+            let mut progress_cb = progress_cb.borrow_mut();
+            progress_cb(total_progress);
+        });
+    });
+}
+
+#[cfg(feature = "flatpak")]
+fn add_flatpak_updates(
+    inst: &Installation,
+    tx: &Transaction,
+    refs: &[String],
+) -> Result<usize, String> {
+    let mut added = 0usize;
+    for ref_str in refs {
+        let r = match Ref::parse(ref_str) {
+            Ok(ok) => ok,
+            Err(err) => {
+                return Err(format!("failed to parse flatpak ref {ref_str}: {err}"));
+            }
+        };
+        let id = r.name().unwrap_or_default();
+        let installed = match inst.installed_ref(
+            r.kind(),
+            &id,
+            r.arch().as_deref(),
+            r.branch().as_deref(),
+            Cancellable::NONE,
+        ) {
+            Ok(installed) => installed,
+            Err(_) => continue,
+        };
+
+        if let Some(eol_rebase) = installed.eol_rebase() {
+            let origin = installed.origin().unwrap_or_default();
+            unsafe {
+                let subpaths = ptr::null_mut();
+                let mut previous_ids = vec![id.as_ptr()];
+                let mut error: *mut libflatpak::glib::ffi::GError = ptr::null_mut();
+                if libflatpak::ffi::flatpak_transaction_add_rebase(
+                    tx.as_ptr(),
+                    origin.as_ptr(),
+                    eol_rebase.as_ptr(),
+                    subpaths,
+                    previous_ids.as_mut_ptr(),
+                    &mut error,
+                ) == 0
+                {
+                    let error_message = if error.is_null() {
+                        "unspecified error".to_string()
+                    } else {
+                        glib::Error::from_glib_ptr_borrow(&error)
+                            .message()
+                            .to_string()
+                    };
+                    return Err(format!(
+                        "failed to rebase {} to {}: {}",
+                        ref_str, eol_rebase, error_message
+                    ));
+                }
+            }
+
+            tx.add_uninstall(ref_str)
+                .map_err(|err| err.to_string())?;
+            added += 1;
+            continue;
+        }
+
+        tx.add_update(ref_str, &[], None)
+            .map_err(|err| err.to_string())?;
+        added += 1;
+    }
+
+    Ok(added)
 }
 
 async fn run_flatpak_selected(entries: &[UpdateEntry]) -> UpdateOutcome {
