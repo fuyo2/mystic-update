@@ -10,10 +10,15 @@ use cosmic::iced::{Alignment, Background, Color, Length, Subscription};
 use cosmic::widget::{self, about::About, menu};
 use cosmic::{prelude::*, Task};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_ICON: &[u8] =
     include_bytes!("../resources/icons/hicolor/scalable/apps/mystic-update.svg");
+const RUNNING_PROGRESS_MIN: f32 = 15.0;
+const RUNNING_PROGRESS_MAX: f32 = 85.0;
+const RUNNING_PROGRESS_STEP: f32 = 3.0;
+const RUNNING_PROGRESS_TICK_MS: u64 = 120;
 
 #[derive(Clone, Debug)]
 struct ManagerState {
@@ -84,6 +89,8 @@ pub struct AppModel {
     show_update_details: bool,
     /// Track update selections at the start of a manager run.
     manager_run_selection: HashMap<ManagerId, Option<Vec<UpdateKey>>>,
+    /// Animated progress phase for indeterminate update bars.
+    progress_phase: f32,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -98,6 +105,7 @@ pub enum Message {
     RunManager(ManagerId),
     RunAll,
     UpdateComplete(ManagerId, UpdateOutcome),
+    ProgressTick,
     SelectManager(ManagerId),
     ToggleUpdate(UpdateKey, bool),
     SelectUpdate(UpdateKey),
@@ -189,6 +197,7 @@ impl cosmic::Application for AppModel {
             details_tab: DetailsTab::Information,
             show_update_details: false,
             manager_run_selection: HashMap::new(),
+            progress_phase: 0.0,
         };
 
         let set_title = app.update_title();
@@ -342,8 +351,11 @@ impl cosmic::Application for AppModel {
                     .height(Length::Fill)
                     .into()
             } else {
-                let updates_header = widget::column::with_capacity(2)
-                    .push(
+                let mut updates_header = widget::column::with_capacity(3);
+                if let Some(banner) = self.running_updates_banner() {
+                    updates_header = updates_header.push(banner);
+                }
+                updates_header = updates_header.push(
                         widget::row::with_capacity(4)
                             .push(widget::horizontal_space())
                             .push(
@@ -356,8 +368,8 @@ impl cosmic::Application for AppModel {
                             )
                             .align_y(Alignment::Center)
                             .spacing(space_s),
-                    )
-                    .push(
+                    );
+                updates_header = updates_header.push(
                         widget::row::with_capacity(2)
                             .push(widget::horizontal_space())
                             .push(widget::text::caption(fl!(
@@ -366,14 +378,14 @@ impl cosmic::Application for AppModel {
                                 total = total_updates
                             )))
                             .align_y(Alignment::Center),
-                    )
-                    .spacing(space_s / 2);
+                    );
+                updates_header = updates_header.spacing(space_s / 2);
 
                 let mut cards = widget::column::with_capacity(self.update_items.len())
                     .width(Length::Fill)
                     .spacing(space_s);
 
-                for item in &self.update_items {
+                for item in self.ordered_update_items() {
                     let key = item.key();
                     let title = widget::text::body(Self::update_display_name(&item.entry));
                     let subtitle = widget::text::caption(Self::update_subtitle(&item.entry));
@@ -475,10 +487,19 @@ impl cosmic::Application for AppModel {
 
     /// Register subscriptions for this application.
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::batch(vec![self
+        let mut subs = vec![self
             .core()
             .watch_config::<Config>(Self::APP_ID)
-            .map(|update| Message::UpdateConfig(update.config))])
+            .map(|update| Message::UpdateConfig(update.config))];
+        if self.any_running() {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(
+                    RUNNING_PROGRESS_TICK_MS,
+                ))
+                .map(|_| Message::ProgressTick),
+            );
+        }
+        Subscription::batch(subs)
     }
 
     /// Handles messages emitted by the application and its widgets.
@@ -643,6 +664,11 @@ impl cosmic::Application for AppModel {
             Message::UpdateConfig(config) => {
                 self.config = config;
             }
+            Message::ProgressTick => {
+                if self.any_running() {
+                    self.advance_progress_phase();
+                }
+            }
             Message::LaunchUrl(url) => match open::that_detached(&url) {
                 Ok(()) => {}
                 Err(err) => {
@@ -762,6 +788,48 @@ impl AppModel {
             .any(|state| matches!(state.status, TaskStatus::Running))
     }
 
+    fn is_manager_running(&self, id: ManagerId) -> bool {
+        self.managers
+            .get(&id)
+            .is_some_and(|state| matches!(state.status, TaskStatus::Running))
+    }
+
+    fn running_manager_summary(&self) -> Option<String> {
+        let labels: Vec<&str> = self
+            .managers
+            .iter()
+            .filter_map(|(id, state)| {
+                if matches!(state.status, TaskStatus::Running) {
+                    Some(id.spec().label)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if labels.is_empty() {
+            None
+        } else {
+            Some(labels.join(", "))
+        }
+    }
+
+    fn running_updates_banner(&self) -> Option<Element<'_, Message>> {
+        let managers = self.running_manager_summary()?;
+        let space_s = cosmic::theme::spacing().space_s;
+        Some(
+            widget::row::with_capacity(2)
+                .push(widget::icon::from_name("process-working-symbolic"))
+                .push(widget::text::caption(fl!(
+                    "updates-running",
+                    managers = managers
+                )))
+                .align_y(Alignment::Center)
+                .spacing(space_s / 2)
+                .into(),
+        )
+    }
+
     fn any_checking(&self) -> bool {
         self.managers.values().any(|state| state.checking)
     }
@@ -819,6 +887,20 @@ impl AppModel {
             .filter(|item| item.entry.manager == id && item.checked)
             .map(|item| item.entry.clone())
             .collect()
+    }
+
+    fn ordered_update_items(&self) -> Vec<&UpdateItem> {
+        let mut items: Vec<(usize, &UpdateItem)> =
+            self.update_items.iter().enumerate().collect();
+        items.sort_by(|(left_index, left), (right_index, right)| {
+            let left_running = self.is_manager_running(left.entry.manager);
+            let right_running = self.is_manager_running(right.entry.manager);
+            if left_running != right_running {
+                return right_running.cmp(&left_running);
+            }
+            left_index.cmp(right_index)
+        });
+        items.into_iter().map(|(_, item)| item).collect()
     }
 
     fn set_update_entries(&mut self, id: ManagerId, entries: Vec<UpdateEntry>) {
@@ -967,9 +1049,29 @@ impl AppModel {
         };
 
         match &state.status {
-            TaskStatus::Running => Some(50.0),
+            TaskStatus::Running => Some(self.running_progress_value()),
             _ => None,
         }
+    }
+
+    fn advance_progress_phase(&mut self) {
+        let span = RUNNING_PROGRESS_MAX - RUNNING_PROGRESS_MIN;
+        if span <= 0.0 {
+            return;
+        }
+        let cycle = span * 2.0;
+        self.progress_phase = (self.progress_phase + RUNNING_PROGRESS_STEP) % cycle;
+    }
+
+    fn running_progress_value(&self) -> f32 {
+        let span = RUNNING_PROGRESS_MAX - RUNNING_PROGRESS_MIN;
+        if span <= 0.0 {
+            return RUNNING_PROGRESS_MIN;
+        }
+        let cycle = span * 2.0;
+        let phase = self.progress_phase % cycle;
+        let offset = if phase <= span { phase } else { cycle - phase };
+        RUNNING_PROGRESS_MIN + offset
     }
 
     fn details_tabs(&self) -> Element<'_, Message> {

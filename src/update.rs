@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum ManagerId {
@@ -214,6 +215,10 @@ const APT_CHECK_COMMANDS: &[CommandSpec] = &[CommandSpec {
     args: &["list", "--upgradable"],
     requires_privilege: false,
 }];
+const APT_LOCK_RETRY_LIMIT: usize = 12;
+const APT_LOCK_RETRY_INITIAL_DELAY_SECS: u64 = 5;
+const APT_LOCK_RETRY_MAX_DELAY_SECS: u64 = 30;
+const APT_LOCK_ERROR_MESSAGE: &str = "APT is locked by another process. Please try again later.";
 
 impl ManagerId {
     pub fn all() -> &'static [ManagerId] {
@@ -331,17 +336,23 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
         };
         output.push_str(&line);
 
-        let run_result = if cmd.requires_privilege {
-            run_privileged(cmd.program, cmd.args).await
-        } else {
-            run_unprivileged(cmd.program, cmd.args).await
-        };
+        let run_result =
+            run_command_with_optional_apt_retry(cmd.program, cmd.args, cmd.requires_privilege)
+                .await;
 
         match run_result {
-            Ok((bytes, status_code)) => {
-                output.push_str(&String::from_utf8_lossy(&bytes));
-                if status_code != 0 {
-                    let status = format!("Exited with status: {status_code}");
+            Ok(run) => {
+                output.push_str(&String::from_utf8_lossy(&run.bytes));
+                if run.apt_lock {
+                    output.push_str(APT_LOCK_ERROR_MESSAGE);
+                    output.push('\n');
+                    return UpdateOutcome {
+                        output,
+                        status: TaskStatus::Failed(APT_LOCK_ERROR_MESSAGE.to_string()),
+                    };
+                }
+                if run.status_code != 0 {
+                    let status = format!("Exited with status: {}", run.status_code);
                     output.push_str(&status);
                     output.push('\n');
                     return UpdateOutcome {
@@ -390,10 +401,25 @@ pub async fn check_manager(id: ManagerId, force_privileged: bool) -> CheckOutcom
             || (force_privileged
                 && spec.requires_privilege
                 && id != ManagerId::Flatpak);
-        match run_command(cmd.program, cmd.args, needs_privilege).await {
-            Ok((bytes, status_code)) => {
-                output.push_str(&String::from_utf8_lossy(&bytes));
-                last_status = status_code;
+        match run_command_with_optional_apt_retry(cmd.program, cmd.args, needs_privilege).await {
+            Ok(run) => {
+                output.push_str(&String::from_utf8_lossy(&run.bytes));
+                last_status = run.status_code;
+                if run.apt_lock {
+                    return CheckOutcome {
+                        output,
+                        has_updates: false,
+                        error: Some(APT_LOCK_ERROR_MESSAGE.to_string()),
+                    };
+                }
+                if id == ManagerId::Apt && run.status_code != 0 {
+                    let err = format!("APT check failed with status {}", run.status_code);
+                    return CheckOutcome {
+                        output,
+                        has_updates: false,
+                        error: Some(err),
+                    };
+                }
             }
             Err(err) => {
                 output.push_str(&err);
@@ -470,6 +496,103 @@ async fn run_command(
     } else {
         run_unprivileged(program, args).await
     }
+}
+
+struct CommandRun {
+    bytes: Vec<u8>,
+    status_code: i32,
+    apt_lock: bool,
+}
+
+async fn run_command_with_optional_apt_retry(
+    program: &str,
+    args: &[&str],
+    requires_privilege: bool,
+) -> Result<CommandRun, String> {
+    if is_apt_program(program) {
+        run_command_with_apt_lock_retry(program, args, requires_privilege).await
+    } else {
+        let (bytes, status_code) = run_command(program, args, requires_privilege).await?;
+        Ok(CommandRun {
+            bytes,
+            status_code,
+            apt_lock: false,
+        })
+    }
+}
+
+async fn run_command_with_apt_lock_retry(
+    program: &str,
+    args: &[&str],
+    requires_privilege: bool,
+) -> Result<CommandRun, String> {
+    let mut combined = Vec::new();
+    let mut delay_secs = APT_LOCK_RETRY_INITIAL_DELAY_SECS;
+    let mut retries = 0usize;
+
+    loop {
+        let (bytes, status_code) = run_command(program, args, requires_privilege).await?;
+        combined.extend_from_slice(&bytes);
+
+        let text = String::from_utf8_lossy(&bytes);
+        if is_apt_lock_error(&text) {
+            if retries < APT_LOCK_RETRY_LIMIT {
+                let note = format!(
+                    "\n[mystic-update] APT lock detected; retrying in {}s (attempt {}/{})...\n",
+                    delay_secs,
+                    retries + 1,
+                    APT_LOCK_RETRY_LIMIT
+                );
+                combined.extend_from_slice(note.as_bytes());
+                sleep(Duration::from_secs(delay_secs)).await;
+                retries += 1;
+                delay_secs = std::cmp::min(
+                    delay_secs.saturating_mul(2),
+                    APT_LOCK_RETRY_MAX_DELAY_SECS,
+                );
+                continue;
+            }
+
+            let total_attempts = retries + 1;
+            let note = format!(
+                "\n[mystic-update] APT lock still held after {total_attempts} attempts; giving up.\n"
+            );
+            combined.extend_from_slice(note.as_bytes());
+            return Ok(CommandRun {
+                bytes: combined,
+                status_code,
+                apt_lock: true,
+            });
+        }
+
+        return Ok(CommandRun {
+            bytes: combined,
+            status_code,
+            apt_lock: false,
+        });
+    }
+}
+
+fn is_apt_program(program: &str) -> bool {
+    matches!(program, "apt" | "apt-get")
+}
+
+fn is_apt_lock_error(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    if lower.contains("permission denied") {
+        return false;
+    }
+
+    [
+        "could not get lock",
+        "unable to acquire the dpkg frontend lock",
+        "unable to lock the administration directory",
+        "is another process using it",
+        "is held by process",
+        "waiting for cache lock",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
 }
 
 async fn run_privileged(
@@ -905,11 +1028,18 @@ async fn run_command_logged(
     };
     output.push_str(&line);
 
-    let run_result = run_command(program, &arg_refs, requires_privilege).await?;
-    output.push_str(&String::from_utf8_lossy(&run_result.0));
+    let run_result =
+        run_command_with_optional_apt_retry(program, &arg_refs, requires_privilege).await?;
+    output.push_str(&String::from_utf8_lossy(&run_result.bytes));
 
-    if run_result.1 != 0 {
-        let status = format!("Exited with status: {}", run_result.1);
+    if run_result.apt_lock {
+        output.push_str(APT_LOCK_ERROR_MESSAGE);
+        output.push('\n');
+        return Err(APT_LOCK_ERROR_MESSAGE.to_string());
+    }
+
+    if run_result.status_code != 0 {
+        let status = format!("Exited with status: {}", run_result.status_code);
         output.push_str(&status);
         output.push('\n');
         Err(status)

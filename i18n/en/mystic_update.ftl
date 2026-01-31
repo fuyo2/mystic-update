@@ -40,6 +40,7 @@ logs = Logs
 system-up-to-date = System up to date.
 updates-available = Updates available.
 updates-checking = Summoning Updates
+updates-running = Updating: { $managers }
 select-manager = Select a manager to view output.
 detected-summary = Detected { $available } Summoners
 status-available = Available
