@@ -402,9 +402,15 @@ pub async fn run_manager(id: ManagerId) -> UpdateOutcome {
     }
 }
 
-async fn run_dnf_yum_selected(
+const PULSE_PROGRESS_MIN: f32 = 10.0;
+const PULSE_PROGRESS_MAX: f32 = 90.0;
+const PULSE_PROGRESS_STEP: f32 = 4.0;
+const PULSE_PROGRESS_TICK_MS: u64 = 180;
+
+async fn run_dnf_yum_with_progress(
     id: ManagerId,
-    entries: &[UpdateEntry],
+    entries: Option<Vec<UpdateEntry>>,
+    progress: Option<ProgressTracker>,
 ) -> UpdateOutcome {
     let spec = id.spec();
     let mut output = String::new();
@@ -416,15 +422,16 @@ async fn run_dnf_yum_selected(
         };
     };
 
-    let mut package_names: Vec<String> = entries
-        .iter()
-        .map(|entry| entry.id.clone())
-        .collect();
-    package_names.sort();
-    package_names.dedup();
-
     let mut args: Vec<String> = cmd.args.iter().map(|arg| (*arg).to_string()).collect();
-    args.extend(package_names);
+    if let Some(entries) = entries {
+        let mut package_names: Vec<String> = entries
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        package_names.sort();
+        package_names.dedup();
+        args.extend(package_names);
+    }
     let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
 
     let line = if cmd.requires_privilege {
@@ -434,7 +441,44 @@ async fn run_dnf_yum_selected(
     };
     output.push_str(&line);
 
-    match run_command_with_optional_apt_retry(cmd.program, &arg_refs, cmd.requires_privilege).await {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let progress_task = if progress.is_some() {
+        let progress_clone = progress.clone();
+        let stop_clone = Arc::clone(&stop_flag);
+        Some(tokio::spawn(async move {
+            let mut value = PULSE_PROGRESS_MIN;
+            let mut direction = 1.0_f32;
+            report_progress(&progress_clone, id, value);
+            while !stop_clone.load(Ordering::Relaxed) {
+                sleep(Duration::from_millis(PULSE_PROGRESS_TICK_MS)).await;
+                if stop_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                value += PULSE_PROGRESS_STEP * direction;
+                if value >= PULSE_PROGRESS_MAX {
+                    value = PULSE_PROGRESS_MAX;
+                    direction = -1.0;
+                } else if value <= PULSE_PROGRESS_MIN {
+                    value = PULSE_PROGRESS_MIN;
+                    direction = 1.0;
+                }
+                report_progress(&progress_clone, id, value);
+            }
+        }))
+    } else {
+        None
+    };
+
+    let run_result =
+        run_command_with_optional_apt_retry(cmd.program, &arg_refs, cmd.requires_privilege).await;
+
+    stop_flag.store(true, Ordering::Relaxed);
+    if let Some(task) = progress_task {
+        let _ = task.await;
+    }
+    clear_progress(&progress, id);
+
+    match run_result {
         Ok(run) => {
             output.push_str(&String::from_utf8_lossy(&run.bytes));
             if run.apt_lock {
@@ -527,10 +571,7 @@ pub async fn run_manager_with_progress(
             };
         }
         ManagerId::Dnf | ManagerId::Yum => {
-            return match entries {
-                Some(entries) => run_dnf_yum_selected(id, &entries).await,
-                None => run_manager(id).await,
-            };
+            return run_dnf_yum_with_progress(id, entries, progress).await;
         }
         _ => run_manager(id).await,
     }
