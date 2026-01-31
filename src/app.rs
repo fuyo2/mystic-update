@@ -1289,7 +1289,7 @@ impl AppModel {
         }
 
         if entry.manager == ManagerId::Flatpak {
-            return self.flatpak_update_icon(entry);
+            return self.flatpak_update_icon(entry, 48);
         }
 
         widget::icon::from_name("package-x-generic-symbolic")
@@ -1297,7 +1297,7 @@ impl AppModel {
             .icon()
     }
 
-    fn flatpak_update_icon(&self, entry: &UpdateEntry) -> widget::icon::Icon {
+    fn flatpak_update_icon(&self, entry: &UpdateEntry, size: u16) -> widget::icon::Icon {
         let app_id = update::flatpak_app_id_from_ref(&entry.id)
             .filter(|id| !id.trim().is_empty())
             .or_else(|| {
@@ -1310,11 +1310,11 @@ impl AppModel {
             });
 
         if let Some(app_id) = app_id {
-            return Self::icon_from_name_or_fallback(&app_id, 32);
+            return Self::icon_from_name_or_fallback(&app_id, size);
         }
 
         widget::icon::from_name("package-x-generic-symbolic")
-            .size(32)
+            .size(size)
             .icon()
     }
 
