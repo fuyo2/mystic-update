@@ -463,6 +463,11 @@ pub async fn check_manager(id: ManagerId, force_privileged: bool) -> CheckOutcom
     let spec = id.spec();
     let mut output = String::new();
     let mut last_status = 0;
+    let force_privileged = if id == ManagerId::Apt && cfg!(feature = "packagekit") {
+        false
+    } else {
+        force_privileged
+    };
 
     for cmd in spec.check_commands {
         let line = format!("$ {} {}\n", cmd.program, cmd.args.join(" "));
