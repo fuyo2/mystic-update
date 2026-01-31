@@ -427,19 +427,29 @@ async fn run_dnf_yum_with_progress(
         package_names.dedup();
         args.extend(package_names);
     }
+    let mut program = cmd.program;
+    if id == ManagerId::Yum && command_exists("stdbuf").await {
+        let mut wrapped_args = Vec::with_capacity(args.len() + 3);
+        wrapped_args.push("-o0".to_string());
+        wrapped_args.push("-e0".to_string());
+        wrapped_args.push(program.to_string());
+        wrapped_args.extend(args);
+        program = "stdbuf";
+        args = wrapped_args;
+    }
     let arg_refs: Vec<&str> = args.iter().map(|arg| arg.as_str()).collect();
 
     let line = if cmd.requires_privilege {
-        format!("$ pkexec {} {}\n", cmd.program, arg_refs.join(" "))
+        format!("$ pkexec {} {}\n", program, arg_refs.join(" "))
     } else {
-        format!("$ {} {}\n", cmd.program, arg_refs.join(" "))
+        format!("$ {} {}\n", program, arg_refs.join(" "))
     };
     output.push_str(&line);
 
     report_progress(&progress, id, 0.0);
     let mut parser = DnfYumProgress::new();
     let run_result = run_command_streaming(
-        cmd.program,
+        program,
         &arg_refs,
         cmd.requires_privilege,
         |line| {
@@ -526,15 +536,28 @@ async fn run_command_streaming(
     drop(tx);
 
     let mut output = Vec::new();
+    let mut pending = String::new();
     while let Some(chunk) = rx.recv().await {
         output.extend_from_slice(&chunk);
         let text = String::from_utf8_lossy(&chunk);
-        for segment in text.split('\r') {
-            let segment = segment.trim_end_matches('\n');
-            if !segment.is_empty() {
-                on_line(segment);
+        pending.push_str(&text);
+        let mut start = 0usize;
+        for (idx, ch) in pending.char_indices() {
+            if ch == '\n' || ch == '\r' {
+                let segment = pending[start..idx].trim();
+                if !segment.is_empty() {
+                    on_line(segment);
+                }
+                start = idx + ch.len_utf8();
             }
         }
+        if start > 0 {
+            pending = pending[start..].to_string();
+        }
+    }
+    let trailing = pending.trim();
+    if !trailing.is_empty() {
+        on_line(trailing);
     }
 
     let status = child.wait().await.map_err(|err| err.to_string())?;
@@ -564,17 +587,16 @@ where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::new(reader);
-    let mut buffer = Vec::new();
+    let mut buffer = [0u8; 8192];
     loop {
-        buffer.clear();
         let bytes_read = reader
-            .read_until(b'\n', &mut buffer)
+            .read(&mut buffer)
             .await
             .map_err(|err| err.to_string())?;
         if bytes_read == 0 {
             break;
         }
-        if tx.send(buffer.clone()).is_err() {
+        if tx.send(buffer[..bytes_read].to_vec()).is_err() {
             break;
         }
     }
