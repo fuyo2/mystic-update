@@ -21,7 +21,7 @@ use std::rc::Rc;
 use packagekit_zbus::{
     PackageKit::PackageKitProxyBlocking,
     Transaction::TransactionProxyBlocking,
-    zbus::blocking::Connection,
+    zbus::blocking::{Connection, Proxy},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -746,12 +746,51 @@ pub struct CheckOutcome {
 }
 
 pub async fn reboot_system() -> Result<(), String> {
+    let logind_error = {
+        #[cfg(feature = "packagekit")]
+        {
+            match reboot_via_logind().await {
+                Ok(()) => return Ok(()),
+                Err(err) => Some(err),
+            }
+        }
+        #[cfg(not(feature = "packagekit"))]
+        {
+            None
+        }
+    };
+
     let (_, status_code) = run_privileged("systemctl", &["reboot"]).await?;
     if status_code == 0 {
         Ok(())
+    } else if let Some(err) = logind_error {
+        Err(format!("{err}\nreboot failed with status {status_code}"))
     } else {
         Err(format!("reboot failed with status {status_code}"))
     }
+}
+
+#[cfg(feature = "packagekit")]
+async fn reboot_via_logind() -> Result<(), String> {
+    tokio::task::spawn_blocking(reboot_via_logind_blocking)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+#[cfg(feature = "packagekit")]
+fn reboot_via_logind_blocking() -> Result<(), String> {
+    let connection = Connection::system().map_err(|err| err.to_string())?;
+    let proxy = Proxy::new(
+        &connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .map_err(|err| err.to_string())?;
+    let _: () = proxy
+        .call("Reboot", &(true,))
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 async fn command_exists(command_name: &str) -> bool {
