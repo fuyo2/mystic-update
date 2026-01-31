@@ -1032,7 +1032,11 @@ impl AppModel {
         let entry = UpdateEntry {
             manager: manager_for_update,
             id: SYSTEM_UPDATES_ID.to_string(),
-            name: fl!("system-updates"),
+            name: format!(
+                "{} ({})",
+                fl!("system-updates"),
+                manager_for_update.spec().label
+            ),
             current_version: None,
             new_version: None,
             scope: None,
